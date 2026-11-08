@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-python3:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ccs client suite (runner python3)
+        run: |
+          # Hermetic: a fake HTTP server on 127.0.0.1, a fake redactor with the
+          # frozen session_redact API, and a temp $HOME. ripgrep makes the
+          # fallback cases run instead of skip; CCS_TEST_CODEX makes the
+          # native Codex cases run instead of skip.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ripgrep
+          npm install --prefix /tmp/ccs-test-codex --no-audit --no-fund @openai/codex@0.162.1
+          codex_test_bin=$(find /tmp/ccs-test-codex/node_modules -type f -path '*/vendor/*/bin/codex' -print -quit)
+          test -x "$codex_test_bin"
+          CCS_TEST_CODEX="$codex_test_bin" python3 -m unittest discover -s tests -v
+
+  test-python39:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ripgrep and the native Codex binary
+        run: |
+          # The same cases as test-python3: without these the fallback and
+          # native Codex cases would skip on 3.9.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ripgrep
+          npm install --prefix /tmp/ccs-test-codex --no-audit --no-fund @openai/codex@0.162.1
+          codex_test_bin=$(find /tmp/ccs-test-codex/node_modules -type f -path '*/vendor/*/bin/codex' -print -quit)
+          test -x "$codex_test_bin"
+          echo "CCS_TEST_CODEX=$codex_test_bin" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: ccs client suite (Python 3.9, the macOS system python)
+        run: |
+          python --version
+          python -W error::ResourceWarning -m unittest discover -s tests

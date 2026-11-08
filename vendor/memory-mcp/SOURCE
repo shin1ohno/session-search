@@ -1,0 +1,10 @@
+repo: https://github.com/shin1ohno/setup
+commit: e2d1e01ae491e2efe7ecaf9602e8fb2b8745753c
+
+path: cookbooks/lxc-es-memory/files/memory-mcp/session_redact.py
+blob: 95a5a063492030c1e86e18104568bc9a04189738
+vendored-as: vendor/memory-mcp/session_redact.py
+
+path: cookbooks/lxc-es-memory/files/memory-mcp/session_codex.py
+blob: a267890c0b118caf41dfab83494c74da2b928d40
+vendored-as: vendor/memory-mcp/session_codex.py
