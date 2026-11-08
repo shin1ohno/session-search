@@ -31,6 +31,7 @@ TOMBSTONE_TYPE = "session-search-tombstone"
 
 _MAIN_RE = re.compile(r"^([^/]+)/([^/]+)\.jsonl$")
 _SUB_RE = re.compile(r"^([^/]+)/([^/]+)/subagents/(agent-[^/]+)\.jsonl$")
+_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 
 
 class ShipError(Exception):
@@ -325,6 +326,12 @@ class Shipper:
             if not raw.strip():
                 continue
             masked, counts = self._mask_line(raw)
+            # json.loads accepts lone surrogate escapes in keys and values.
+            # The server rejects them; replace the line before UTF-8 encoding.
+            if _SURROGATE_RE.search(masked):
+                masked = _tomb_line("surrogate", [], line_off)
+                self.stats["tombstones"] += 1
+                util.log("WARN", "ingest: surrogate at offset %d -> tombstoned" % line_off)
             for k, v in (counts or {}).items():
                 kinds[k] = kinds.get(k, 0) + v
             lines.append(masked)
