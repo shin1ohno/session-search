@@ -79,7 +79,7 @@ jobs:
           echo "Publication eligibility: $ready"
   publish:
     needs: [ci, build, release-check]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.release-check.outputs.ready == 'true'
+    if: vars.CCS_RELEASE_ENABLED == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.release-check.outputs.ready == 'true'
     runs-on: ubuntu-22.04
     permissions:
       contents: write

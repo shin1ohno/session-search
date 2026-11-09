@@ -310,7 +310,8 @@ fn run_inner(args: &[std::ffi::OsString]) -> Result<()> {
         return Err("corpus count or digest mismatch".into());
     }
     eprintln!(
-        "conformance redact: vectors={count} failures={failures} emitted={emitted} pass_limit=8"
+        "conformance redact: vectors={count} failures={failures} emitted={emitted} pass_limit={}",
+        ccs_redact::MAX_PASSES
     );
     if failures != 0 {
         return Err("conformance mismatch".into());
