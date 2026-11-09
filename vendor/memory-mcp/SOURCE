@@ -11,8 +11,10 @@ vendored-as: vendor/memory-mcp/session_codex.py
 
 repo: https://github.com/shin1ohno/ai-memory
 commit: 572645dbf24d474efdae41050e60a75af1c2b6b8
-# Blob OIDs are authoritative. This branch commit is historical provenance;
-# a squash merge orphans it from main history while preserving the blobs.
+# Blob OIDs are authoritative; this ai-memory branch commit is content provenance,
+# not a deploy pin. These corpora, generator and runners are staged here so that
+# the trusted GitHub App can import them from session-search main into ai-memory
+# with the same (mode, OID), after the source PR is merged.
 
 path: memory-mcp/conformance/session_redact_r1.jsonl
 blob: fa476b85cb724b99a0d47c17ebaf65be39cfd60d
@@ -21,3 +23,18 @@ vendored-as: vendor/memory-mcp/conformance/session_redact_r1.jsonl
 path: memory-mcp/conformance/session_codex_v1.jsonl
 blob: 181bd89f098251d39ba92ce421c444e5fd5ead26
 vendored-as: vendor/memory-mcp/conformance/session_codex_v1.jsonl
+
+path: memory-mcp/conformance/gen_vectors.py
+mode: 100644
+blob: 74dede59707fef88134c2fe8afd21d61e5fe2814
+vendored-as: vendor/memory-mcp/conformance/gen_vectors.py
+
+path: memory-mcp/test_session_redact_conformance.py
+mode: 100644
+blob: cc2f694e96038d04cf42cd365f9ed8fd7e298365
+vendored-as: vendor/memory-mcp/test_session_redact_conformance.py
+
+path: memory-mcp/test_session_codex_conformance.py
+mode: 100644
+blob: 44e481dabc5c21291015ca086bd664f3e82aabd0
+vendored-as: vendor/memory-mcp/test_session_codex_conformance.py

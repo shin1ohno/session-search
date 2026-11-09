@@ -33,10 +33,10 @@ fault injection only. The ordinary helper tests run without that restriction.
 both commands are Python; S2 supplies Rust and Python with the two variables.
 Both Python CI jobs explicitly set
 `CCS_UNDER_TEST` to the current interpreter and a staged copy of the real client
-with the real server modules. This exercises S0's external-command contract
-(stage table, plan line 469). Section 3.5 (lines 280–293) requires the N8 CI
-negative control at S0; S1's CI change (line 470) is the later Rust build workflow. A
-passing S0 run does not establish Python/Rust interoperability.
+with the real server modules. This exercises the external-command contract in CI as well as locally.
+S0 also runs the N8 negative control through the Python corpus runners.
+The Rust build workflow belongs to S1. A passing S0 run does not establish
+Python/Rust interoperability.
 
 ## CLI and output
 
@@ -207,14 +207,16 @@ tests and one provenance test bring the S0 contract suite to 102 tests. With the
 
 ## Merge and rollback
 
-Merge the ai-memory corpus first, then the session-search vendor/contract PR, then
-setup's server-copy and pin PR, following setup ADR 0014 section on shared server
-modules. Setup's `ai-memory.pin` must name a commit already on ai-memory main, and
+Merge the session-search vendor/contract PR first. The trusted GitHub App then
+imports the corpora, generator and runners from that merged default-branch
+commit into ai-memory, preserving every file's mode and blob OID. After the
+App-authored import PR is approved and merged, merge setup's server-copy and
+pin PR, following setup ADR 0013 and ADR 0014. Setup's `ai-memory.pin` must name a commit already on ai-memory main, and
 all mapped copies must match its mode/OID. In SOURCE, the recorded blob OID is
-the content authority. The commit is the import branch's historical provenance;
-it is not a main ancestor and becomes orphaned from main's history after a squash.
-A squash preserves the blob. Do not treat that recorded commit as a deploy pin
-or manufacture a main ancestor or weaken the check.
+the content authority. The recorded ai-memory branch commit is content provenance, not a main
+ancestor or a deploy pin. These vendored files supply the App import; the
+resulting ai-memory main commit will become the server pin. The import must
+preserve the blobs. Do not manufacture a main ancestor or weaken the check.
 The initial A1 session-search pin can use the already merged baseline commit.
 
 R0 reverts this contract PR and setup's separate corpus/ai-memory-pin commit.

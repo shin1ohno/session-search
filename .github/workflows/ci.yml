@@ -16,8 +16,9 @@ jobs:
 
       - name: ccs client suite (runner python3)
         run: |
-          # Hermetic: a fake HTTP server on 127.0.0.1, the real vendored
-          # redactor, and a temp $HOME. ripgrep makes the
+          # Hermetic: a fake HTTP server on 127.0.0.1 and a temp $HOME.
+          # Contract tests use the real vendored redactor; unit tests also
+          # use FakeRedactor fixtures. ripgrep makes the
           # fallback cases run instead of skip; CCS_TEST_CODEX makes the
           # native Codex cases run instead of skip.
           sudo apt-get update -qq
