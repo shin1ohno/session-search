@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Differential test: Rust vs session_redact.py. Prints counts and a few diffs (kinds only)."""
+import argparse
 import importlib.util
 import json
 import os
@@ -7,8 +8,16 @@ import random
 import subprocess
 import sys
 
-sr_path, bin_path, out_path = sys.argv[1:4]
-N_FUZZ = int(sys.argv[4]) if len(sys.argv) > 4 else 100000
+from regressions import records as regression_records, lines as regression_lines
+from line_oracle import expected as line_expected
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('source');parser.add_argument('binary');parser.add_argument('output')
+parser.add_argument('count',type=int,nargs='?',default=100000)
+parser.add_argument('--seed',type=int,default=20261109)
+parser.add_argument('--regressions-only',action='store_true')
+args=parser.parse_args()
+sr_path,bin_path,out_path=args.source,args.binary,args.output
+N_FUZZ=0 if args.regressions_only else args.count
 spec = importlib.util.spec_from_file_location("sr", sr_path)
 sr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sr)
@@ -45,7 +54,7 @@ def text(v):
     add("detect", v)
 
 
-for v in VEC.values():
+for v in ([] if args.regressions_only else VEC.values()):
     text(v)
     for a in BOUND:
         for b in BOUND:
@@ -57,7 +66,7 @@ for v in VEC.values():
         if x in v:
             text(v.replace(x, y))
 base_n = len(reqs)
-rnd = random.Random(20261109)
+rnd = random.Random(args.seed)
 frags = list(VEC.values()) + BOUND + ["key", "token", "secret", "pass", "://", "@", ":", "=", "sk-", "eyJ", "AKIA", "AIza", "gh", "xoxb-", "glpat-",
                                       "-----BEGIN ", "PRIVATE KEY-----", "-----END ", "[REDACTED:", "]", "abcdefgh", "ABCDEFGHIJKLMNOP", "1234567890", "\\", '"']
 for _ in range(N_FUZZ):
@@ -75,7 +84,7 @@ d = "leaf sk-ant-" + "a" * 24
 for _ in range(63):
     d = [d] if rnd.random() < 0.5 else {"k": d}
 recs.append(d)
-for _ in range(4000):
+for _ in range(0 if args.regressions_only else 4000):
     def gen(depth):
         r = rnd.random()
         if depth > 5 or r < 0.45:
@@ -86,13 +95,23 @@ for _ in range(4000):
             return {("".join(rnd.choice(frags) for _ in range(rnd.randint(0, 3)))): gen(depth + 1) for _ in range(rnd.randint(0, 4))}
         return rnd.choice([1, 1.5, None, True, False])
     recs.append(gen(0))
+named=regression_records()
+if args.regressions_only: recs=[]
+labels=['generated']*len(reqs)+['record']*len(recs)+[name for name,_ in named]
+recs.extend(record for _,record in named)
 for r in recs:
     add("record", r)
+for name,raw in regression_lines():
+    reqs.append({"mode":"line","hex":raw.hex(),"off":1})
+    labels.append(name)
 
 
 def py(req):
     counts = {}
     m = req["mode"]
+    if m == "line":
+        e=line_expected(bytes.fromhex(req["hex"]),req["off"])
+        return {"out":e["output"],"counts":e["counts"],"route":e["route"]}
     if m == "text":
         o, counts = sr.redact_text(req["input"], KEY)
     elif m == "detect":
@@ -116,6 +135,7 @@ for i, (r, e, g) in enumerate(zip(reqs, expected, got)):
     if json.dumps(e, ensure_ascii=False, sort_keys=False) != json.dumps(g, ensure_ascii=False, sort_keys=False) \
             and json.dumps(e, ensure_ascii=False, sort_keys=True) != json.dumps(g, ensure_ascii=False, sort_keys=True):
         diff.append(i)
+        if len(diff)<=10: print("differential mismatch:",labels[i],"index",i)
 # Key order of the record output must match, not only content.
 order = sum(1 for r, e, g in zip(reqs, expected, got)
             if r["mode"] == "record" and json.dumps(e["out"], ensure_ascii=False) != json.dumps(g["out"], ensure_ascii=False))
@@ -125,8 +145,8 @@ for i, (r, e, g) in enumerate(zip(reqs, expected, got)):
         leak += 1
     if r["mode"] == "record" and sr.detect_record(g["out"]) != sr.detect_record(e["out"]):
         leak += 1
-summary = {"cases": len(reqs), "directed_requests": base_n,
-           "fuzz_requests": fuzz_n - base_n, "record_requests": len(reqs) - fuzz_n, "diffs": len(diff), "record_key_order_diffs": order, "python_detect_hits_on_rust_output": leak}
+summary = {"cases": len(reqs), "seed": args.seed, "directed_requests": base_n,
+           "fuzz_requests": fuzz_n - base_n, "record_requests": sum(r["mode"]=="record" for r in reqs), "line_requests": sum(r["mode"]=="line" for r in reqs), "diffs": len(diff), "record_key_order_diffs": order, "python_detect_hits_on_rust_output": leak}
 with open(out_path, "a") as f:
     f.write(json.dumps(summary) + "\n")
 print(json.dumps(summary))

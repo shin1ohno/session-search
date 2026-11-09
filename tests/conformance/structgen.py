@@ -404,6 +404,12 @@ def first_diff(cs, env):
         return -1 if errors else result
 
 
+def verify_rule_results(rules):
+    assert rules and all(v[key] == 0 for v in rules.values()
+                        for key in ("diffs", "span_diffs", "python_detect_hits_on_rust_output")), "per-rule comparison failure"
+    assert all(v["decision_nodes"] > 0 for v in rules.values()), "unvisited rule"
+
+
 t0 = time.time()
 names = list(G.TREES)
 strings = {n: structured_inputs(n) for n in names}
@@ -441,9 +447,7 @@ report["total_python_detect_hits_on_rust_output"] = sum(v["python_detect_hits_on
 report["seconds"] = round(time.time() - t0, 1)
 json.dump(report, open(prefix + "-structgen.json", "w"), ensure_ascii=False, indent=1)
 print(json.dumps({k: v for k, v in report.items() if k != "rules"}), flush=True)
-assert report["total_diffs"] == 0 and report["total_span_diffs"] == 0
-assert report["total_python_detect_hits_on_rust_output"] == 0
-assert all(v["decision_nodes"] > 0 for v in report["rules"].values())
+verify_rule_results(report["rules"])
 if not run_mutants:
     sys.exit(0)
 
@@ -493,24 +497,32 @@ def one(args):
     env = {"CCS_TEST_MUTANT": str(i), "CCS_MUTANT_BINARY": os.environ["CCS_MUTANT_BINARY"]}
     name = m["name"]
     s = first_diff(SPAN_SETS[name], env) or first_diff(SETS[name], env)
-    b = first_diff(BASE_SET, env)
+    # The baseline is a fallback gate, not a second measurement of already
+    # detected mutants. None records that it was not run.
+    b = first_diff(BASE_SET, env) if s == 0 else None
     done[0] += 1
     if done[0] % 50 == 0:
         print("mutants done", done[0], round(time.time() - t0, 1), flush=True)
-    return {"mutant": m["mutant"], "rule": name, "structgen_diffs": s, "baseline_diffs": b}
+    gate = "structure" if s == 1 else "baseline" if b == 1 else None
+    return {"mutant": m["mutant"], "rule": name, "structgen_diffs": s, "baseline_diffs": b, "gate": gate}
 
 
 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
     results = list(ex.map(one, enumerate(mutants["mutants"])))
 os.rmdir(tmpd)
-killed = [r for r in results if r["structgen_diffs"] != 0]
-base_killed = [r for r in results if r["baseline_diffs"] != 0]
+rejected = mutants["rejected"]
+assert mutants["attempted"] == len(results) + len(rejected)
+assert len({r["mutant"] for r in results + rejected}) == mutants["attempted"]
+killed = [r for r in results if r["structgen_diffs"] == 1]
+base_killed = [r for r in results if r["baseline_diffs"] == 1]
 errors = [r for r in results if r["structgen_diffs"] == -1 or r["baseline_diffs"] == -1]
-survivors = [r for r in results if r["structgen_diffs"] == 0]
-summary = {"mutants": len(results), "killed_by_structure_inputs": len(killed), "killed_by_baseline_inputs": len(base_killed), "build_or_run_errors": len(errors),
-           "survivors_of_structure_inputs": [r["mutant"] for r in survivors], "killed_only_by_structure_inputs": sum(1 for r in results if r["structgen_diffs"] != 0 and r["baseline_diffs"] == 0),
-           "killed_only_by_baseline_inputs": [r["mutant"] for r in results if r["structgen_diffs"] == 0 and r["baseline_diffs"] != 0], "baseline_requests": len(base_reqs), "seconds": round(time.time() - t0, 1)}
-json.dump({"summary": summary, "results": results}, open(prefix + "-mutants.json", "w"), ensure_ascii=False, indent=1)
-print(json.dumps(summary, ensure_ascii=False)[:6000])
-
+survivors = [r for r in results if r["structgen_diffs"] == 0 and r["baseline_diffs"] == 0]
+summary = {"mutants": len(results), "attempted": mutants["attempted"], "generator_rejections": len(rejected),
+           "killed_by_structure_inputs": len(killed), "killed_by_baseline_fallback": len(base_killed),
+           "baseline_evaluated": sum(r["baseline_diffs"] is not None for r in results),
+           "build_or_run_errors": len(errors), "survivors_of_all_inputs": [r["mutant"] for r in survivors],
+           "killed_only_by_baseline_inputs": [r["mutant"] for r in base_killed],
+           "baseline_requests": len(base_reqs), "seconds": round(time.time() - t0, 1)}
+json.dump({"summary": summary, "results": results, "generator_rejections": rejected}, open(prefix + "-mutants.json", "w"), ensure_ascii=False, indent=1)
+print(json.dumps(summary, ensure_ascii=False))
 assert not errors, "build/run errors are not mutation detections"

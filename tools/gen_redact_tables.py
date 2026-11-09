@@ -331,9 +331,14 @@ print("python", sys.version.split()[0], "unidata", unicodedata.unidata_version, 
 for r in rules:
     print(r["name"], len(r["pattern"]), r["start"], r["end"], "first_bytes", len(r["first"]))
 
+def verify_rule_mutations(rules, compiled, rejected):
+    assert set(rules) == {r["name"] for r in compiled + rejected}, "rule missing from mutation generation"
+
+
 if len(sys.argv) > 3:
     # One deliberate change per mutant, on the rule's parse tree or its guards.
     mutants = []
+    rejected = []
 
     def next_absent(chars):
         have = set(chars)
@@ -355,8 +360,10 @@ if len(sys.argv) > 3:
                     r["mutant"] = "%s %s %s" % (name, label, kind)
                     mutants.append(r)
                 except SystemExit as e:
-                    pass
-                seq[i] = saved
+                    rejected.append({"mutant": "%s %s %s" % (name, label, kind), "name": name,
+                                     "gate": "generator", "reason": str(e)})
+                finally:
+                    seq[i] = saved
 
             if op in (C.MAX_REPEAT, C.MIN_REPEAT):
                 lo, hi, p = av
@@ -394,8 +401,6 @@ if len(sys.argv) > 3:
                 pass
 
     for name, (tree, icase, full) in TREES.items():
-        if name in ("placeholder", "anchor"):
-            continue
         visit(tree, icase, name, name, tree, icase, full)
         if full:
             continue
@@ -415,6 +420,10 @@ if len(sys.argv) > 3:
                 r["start"] = "NotAfter:%d" % len(CLS)
                 r["mutant"] = "%s guard start class %s" % (name, kind)
                 mutants.append(r)
+    verify_rule_mutations(TREES, mutants, rejected)
     with open(sys.argv[3], "w") as f:
-        json.dump({"cls": len(CLS), "mutants": mutants}, f)
-    print("mutants", len(mutants))
+        json.dump({"cls": len(CLS), "mutants": mutants, "rejected": rejected,
+                   "attempted": len(mutants) + len(rejected)}, f)
+    for row in rejected:
+        print("REJECTED mutant", json.dumps(row), file=sys.stderr)
+    print("mutants", len(mutants), "generator_rejections", len(rejected), "attempted", len(mutants) + len(rejected))

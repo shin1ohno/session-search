@@ -32,7 +32,7 @@ PREDICATES = {
     "subsumed-optional": "the optional group's characters, including any a mutant adds, are inside the unbounded class that follows it: the span is the whole class run with or without the group",
 }
 data = json.load(open(os.path.join(artifact_dir, "gate-mutants.json")))
-survivors = data["summary"]["survivors_of_structure_inputs"]
+survivors = data["summary"]["survivors_of_all_inputs"]
 mutants = {m["mutant"]: m for m in json.load(open(os.path.join(artifact_dir, "mutants.json")))["mutants"]}
 
 
@@ -137,6 +137,8 @@ def subsumed_optional(name, path_text, kind):
         outer_seq, outer_i, outer_ic, _ = chain[-2]
         node, ic = outer_seq[outer_i], outer_ic
         chain = chain[:-1]
+    if has_group(G.TREES[name][0]):
+        return False
     if not is_repeat(node) or node[1][0] != 0:
         return False
     seq, i, sic, _ = chain[-1]

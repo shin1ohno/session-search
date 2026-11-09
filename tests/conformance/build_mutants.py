@@ -24,6 +24,7 @@ copy.mkdir()
 for f in ('Cargo.toml','Cargo.lock','rust-toolchain.toml'):
     shutil.copy2(ROOT/f,copy/f)
 shutil.copytree(ROOT/'crates',copy/'crates')
+for source in (copy/'crates').rglob('*.rs'): source.touch()
 with (copy/'Cargo.toml').open('a') as f:
     f.write('\n[profile.testmut]\ninherits = "release"\nlto = false\ncodegen-units = 16\nstrip = false\n')
 with (copy/'crates/ccs/Cargo.toml').open('a') as f:
@@ -64,3 +65,15 @@ with (a.artifacts/'mutation-build.log').open('w') as log:
     subprocess.run(['cargo','build','--locked','--profile','testmut','--bin','ccs-rule-mutants'],cwd=copy,env=env,stdout=log,stderr=subprocess.STDOUT,check=True)
 shutil.copy2(ROOT/'target/testmut/ccs-rule-mutants',a.artifacts/'ccs-mutants')
 print('PASS isolated generated mutant build:',len(rows),'alternatives')
+# The selector-free test build must still be the current product before any
+# mutant is selected. This also catches stale path-crate build-cache reuse.
+probe=[{'mode':'json','input':r'{"x":"\ud800\udfff"}'},
+       {'mode':'json','input':r'{"url":"https:\/\/u:passw0rd@h"}'},
+       {'mode':'json','input':'{"x":5.960464477539063e-08}'},
+       {'mode':'record','input':{'K'*40+'secret'+'K'*40:'abcdefghij'}}]
+payload=''.join(json.dumps(row)+'\n' for row in probe).encode()
+probe_env=dict(os.environ);probe_env.pop('CCS_TEST_MUTANT',None)
+def output(program):
+    return subprocess.check_output([program,'_conformance','redact','--requests'],input=payload,env=probe_env)
+assert output(a.artifacts/'ccs-baseline')==output(a.artifacts/'ccs-mutants'),'test build differs without a selected mutation'
+print('PASS test build baseline parity on JSON and Unicode key boundaries')
