@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the release step's real shell with failing command producers."""
+"""Check CI/release action pins and propagate release shell producer failures."""
 import json
 import os
 from pathlib import Path
@@ -11,8 +11,14 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 workflow = (root / ".github/workflows/release.yml").read_text()
-actions = re.findall(r"uses: (actions/[^\s]+)", workflow)
-assert actions and all(re.fullmatch(r"actions/[^@]+@[0-9a-f]{40}", action) for action in actions), "release action is not pinned to a commit"
+for name in ("ci.yml", "release.yml"):
+    content = (root / ".github/workflows" / name).read_text()
+    actions = [action for action in re.findall(r"^\s*(?:-\s*)?uses:\s+([^\s#]+)", content, re.MULTILINE)
+               if not action.startswith("./")]
+    assert actions, name + ": no external actions found"
+    for action in actions:
+        assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", action), name + ": action is not pinned to a commit: " + action
+    print("PASS", name, "external action pins:", len(actions))
 step = workflow.split(
     "      - name: Build and exercise the publication gate\n", 1)[1].split("      - uses:", 1)[0]
 body = step.split("        run: |\n", 1)[1]
