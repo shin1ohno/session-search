@@ -1,0 +1,33 @@
+[workspace]
+members = ["crates/ccs-pytext", "crates/ccs-redact", "crates/ccs"]
+resolver = "2"
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.99.1"
+license = "CC0-1.0"
+publish = false
+
+[workspace.dependencies]
+ccs-pytext = { path = "crates/ccs-pytext" }
+ccs-redact = { path = "crates/ccs-redact" }
+regex = "=1.13.1"
+regex-automata = "=0.4.18"
+ring = "=0.17.14"
+ureq = { version = "=3.5.1", default-features = false, features = ["rustls", "gzip"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "=1.0.11"
+flate2 = { version = "=1.1.11", default-features = false, features = ["rust_backend"] }
+tar = { version = "=0.4.46", default-features = false }
+clap = { version = "=4.6.7", default-features = false, features = ["std", "help", "usage", "error-context"] }
+clap_complete = "=4.6.11"
+libc = "=0.2.191"
+base64 = "=0.23.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = true

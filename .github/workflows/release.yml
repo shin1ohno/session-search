@@ -1,0 +1,108 @@
+name: release
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+  build:
+    needs: ci
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
+    env:
+      CCS_BUILD_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust and target
+        run: rustup toolchain install 1.99.1 --profile minimal && rustup target add --toolchain 1.99.1 '${{ matrix.target }}'
+      - name: Build and exercise the publication gate
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          mkdir -p artifact
+          cargo build --locked --release --target "$TARGET" --examples
+          cargo build --locked --release --target "$TARGET" --bin ccs
+          cp "target/$TARGET/release/ccs" "artifact/ccs-$TARGET"
+          cp "target/$TARGET/release/examples/lock_probe" artifact/lock_probe
+          artifact/ccs-"$TARGET" _buildinfo | tee artifact/buildinfo.json
+          python3 tools/test_lock.py artifact/lock_probe | tee artifact/lock.log
+          if python3 tools/release_gate.py "artifact/ccs-$TARGET" "$GITHUB_SHA" "$TARGET" > artifact/gate.log 2>&1; then
+            touch artifact/ready
+          else
+            cat artifact/gate.log
+            grep -Fx 'ccs: conformance is not implemented in S1' artifact/gate.log
+            echo 'PASS negative: publication gate refused the S1 skeleton' | tee artifact/refused.log
+          fi
+          if [ "$(uname -s)" = Darwin ]; then
+            codesign --verify --strict --verbose=2 "artifact/ccs-$TARGET" 2> artifact/signature.log
+            codesign -dv --verbose=4 "artifact/ccs-$TARGET" 2>> artifact/signature.log
+          fi
+          shasum -a 256 "artifact/ccs-$TARGET" > artifact/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ccs-${{ matrix.target }}
+          path: artifact/
+  release-check:
+    needs: [ci, build]
+    runs-on: ubuntu-22.04
+    outputs:
+      ready: ${{ steps.gate.outputs.ready }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ccs-*
+          path: artifacts
+      - id: gate
+        run: |
+          set -eu
+          ready=true
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
+            test -f "artifacts/ccs-$target/ccs-$target"
+            if ! test -f "artifacts/ccs-$target/ready"; then ready=false; fi
+          done
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+          echo "Publication eligibility: $ready"
+  publish:
+    needs: [ci, build, release-check]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.release-check.outputs.ready == 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ccs-*
+          path: artifacts
+      - name: Stage only release binaries
+        run: |
+          mkdir release
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
+            cp "artifacts/ccs-$target/ccs-$target" release/
+          done
+          (cd release && sha256sum ccs-* > SHA256SUMS)
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release/ccs-*
+      - name: Publish verified main commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "ccs-$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "ccs $GITHUB_SHA" release/*
