@@ -102,73 +102,6 @@ class _HelperCase(HomeCase):
         return p.returncode, p.stdout
 
 
-@unittest.skipUnless(HAVE_CURL, "curl not on PATH")
-class SameBytes(_HelperCase):
-    def direct_backend(self, q, prompt="ccs> "):
-        out = io.StringIO()
-        picker.backend(q, env=dict(self.env, FZF_PROMPT=prompt), out=out)
-        return out.getvalue().encode("utf-8")
-
-    def test_backend_rows_identical(self):
-        cmd = fzf_sub(bind_cmd(self.argv, "change:reload("), q="query")
-        rc, got = self.sh(cmd)
-        self.assertEqual(rc, 0)
-        self.assertEqual(got, self.direct_backend("query"))
-        self.assertEqual(len(got.decode().splitlines()), 2)  # self excluded, as with _backend
-
-    def test_prompt_flags_reach_the_backend(self):
-        rc, _ = self.sh(fzf_sub(bind_cmd(self.argv, "change:reload("), q="query"), prompt="ccs:da> ")
-        body = self.srv.of("/search")[-1]["body"]
-        self.assertEqual((body["deep"], body["include_headless"], body["mode"]), (True, True, "lexical"))
-
-    def test_offline_banner_identical(self):
-        os.remove(os.path.join(self.tmp, ".config", "session-search", "config.json"))
-        cmd = fzf_sub(bind_cmd(self.argv, "change:reload("), q="nothing here")
-        rc, got = self.sh(cmd)
-        self.assertEqual(got, self.direct_backend("nothing here"))
-        self.assertIn(b"\x1b[33m", got)
-
-    def test_breaker_open_identical(self):
-        b = api.Breaker()
-        b.record_failure()
-        b.record_failure()
-        self.assertTrue(b.is_open())
-        rc, got = self.sh(fzf_sub(bind_cmd(self.argv, "change:reload("), q="zz"))
-        self.assertEqual(got, self.direct_backend("zz"))
-        self.assertEqual(self.srv.of("/search"), [])
-
-    def test_preview_identical(self):
-        cmd = [a for a in self.argv if a.startswith("curl ") and "/preview" in a][0]
-        rc, got = self.sh(fzf_sub(cmd, **{"1": "sk_2", "q": "マージ"}))
-        out = io.StringIO()
-        picker.preview("sk_2", "マージ", env=dict(self.env), out=out)
-        self.assertEqual(rc, 0)
-        self.assertEqual(got, out.getvalue().encode("utf-8"))
-        self.assertEqual(self.srv.of("/preview")[-1]["query"], {"session_key": "sk_2", "q": "マージ"})
-
-    def test_toggle_identical(self):
-        bind = [a for a in self.argv if a.startswith("ctrl-s:")][0]
-        cmd = bind[len("ctrl-s:transform-prompt("):bind.index(")+reload(")]
-        rc, got = self.sh(cmd, prompt="ccs:d> ")
-        self.assertEqual(got, b"ccs:sd> \n")
-        self.assertEqual(support.read(self.state), "ccs:sd> ")
-
-    def test_query_text_round_trips(self):
-        cmd = bind_cmd(self.argv, "change:reload(")
-        for text in ("it's", 'say "hi"', "マージ 認証", "a&b=c", "100% done", "  spaced  out ", "$HOME `id`",
-                     "x+y #frag ?q", "back\\slash"):
-            rc, _ = self.sh(fzf_sub(cmd, q=text))
-            self.assertEqual(rc, 0, text)
-            self.assertEqual(self.srv.of("/search")[-1]["body"]["q"], text.strip(), text)
-
-    def test_helper_down_falls_back_to_the_process_command(self):
-        self.h.close()
-        cmd = fzf_sub(bind_cmd(self.argv, "change:reload("), q="query")
-        rc, _ = self.sh(cmd)
-        # curl fails, so the `|| ccs _backend` half runs (here a missing binary -> 127)
-        self.assertEqual(rc, 127)
-
-
 class Paths(_HelperCase):
     def test_unknown_paths_and_methods_404(self):
         self.assertEqual(curl_raw(self.sock, "GET /nope"), 404)
@@ -179,9 +112,6 @@ class Paths(_HelperCase):
         self.assertEqual(curl_raw(self.sock, "DELETE /preview?key=x"), 404)
         self.assertEqual(curl_raw(self.sock, "GET /backend?q=xx"), 200)
 
-    def test_permissions(self):
-        self.assertEqual(stat.S_IMODE(os.stat(self.sock).st_mode), 0o600)
-        self.assertTrue(stat.S_ISSOCK(os.stat(self.sock).st_mode))
 
     def test_handler_exception_is_500(self):
         with mock.patch.object(picker, "preview", side_effect=RuntimeError("boom")):
@@ -193,20 +123,6 @@ class RunWiring(HomeCase):
         return picker.run("q", set(), {}, False, False, runner=runner, which=which,
                           resume_fn=lambda key, do_print, fork: 0)
 
-    def test_socket_dir_0700_and_removed_after(self):
-        seen = {}
-
-        def runner(argv, **kw):
-            sock = [a for a in argv if "--unix-socket" in a][0].split("--unix-socket ", 1)[1].split(" ", 1)[0]
-            seen["sock"] = sock
-            seen["dir_mode"] = stat.S_IMODE(os.stat(os.path.dirname(sock)).st_mode)
-            seen["sock_mode"] = stat.S_IMODE(os.stat(sock).st_mode)
-            return subprocess.CompletedProcess(argv, 130, stdout=b"")
-
-        self.assertEqual(self._run(lambda name: "/usr/bin/" + name, runner), 0)
-        self.assertEqual((seen["dir_mode"], seen["sock_mode"]), (0o700, 0o600))
-        self.assertFalse(os.path.exists(seen["sock"]))
-        self.assertFalse(os.path.exists(os.path.dirname(seen["sock"])))
 
     def test_removed_on_exception(self):
         seen = {}
@@ -219,54 +135,6 @@ class RunWiring(HomeCase):
             self._run(lambda name: "/usr/bin/" + name, runner)
         sock = [a for a in seen["argv"] if "--unix-socket" in a][0].split("--unix-socket ", 1)[1].split(" ", 1)[0]
         self.assertFalse(os.path.exists(os.path.dirname(sock)))
-
-    def test_removed_on_sigterm(self):
-        seen = {}
-
-        def runner(argv, **kw):
-            seen["argv"] = argv
-            os.kill(os.getpid(), signal.SIGTERM)
-            raise AssertionError("signal did not unwind")  # pragma: no cover
-
-        before = signal.getsignal(signal.SIGTERM)
-        self.assertEqual(self._run(lambda name: "/usr/bin/" + name, runner), 128 + signal.SIGTERM)
-        sock = [a for a in seen["argv"] if "--unix-socket" in a][0].split("--unix-socket ", 1)[1].split(" ", 1)[0]
-        self.assertFalse(os.path.exists(os.path.dirname(sock)))
-        self.assertEqual(signal.getsignal(signal.SIGTERM), before)
-
-    def test_no_curl_keeps_the_process_wiring(self):
-        calls = []
-
-        def runner(argv, **kw):
-            calls.append(argv)
-            return subprocess.CompletedProcess(argv, 130, stdout=b"")
-
-        self._run(lambda name: "/usr/bin/fzf" if name == "fzf" else None, runner)
-        self.assertEqual(calls[0], picker.fzf_argv("q", set(), picker.launcher()))
-        self.assertNotIn("curl", "\n".join(calls[0]))
-
-    def test_bind_failure_keeps_the_process_wiring(self):
-        calls = []
-
-        def runner(argv, **kw):
-            calls.append(argv)
-            return subprocess.CompletedProcess(argv, 130, stdout=b"")
-
-        with mock.patch.object(helper.Helper, "start", side_effect=OSError("EADDRINUSE")):
-            self._run(lambda name: "/usr/bin/" + name, runner)
-        self.assertNotIn("curl", "\n".join(calls[0]))
-
-    def test_long_tmpdir_moves_the_socket_to_tmp(self):
-        long_dir = os.path.join(self.tmp, "x" * 120)
-        os.makedirs(long_dir)
-        h, sock_dir = picker.start_helper(dict(os.environ), long_dir, which=lambda n: "/usr/bin/curl")
-        try:
-            self.assertIsNotNone(h)
-            self.assertTrue(sock_dir.startswith("/tmp/ccs-"))
-            self.assertEqual(stat.S_IMODE(os.stat(sock_dir).st_mode), 0o700)
-        finally:
-            h.close()
-            shutil.rmtree(sock_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

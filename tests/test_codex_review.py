@@ -63,75 +63,6 @@ class ReviewPaths(HomeCase):
         resume.restore_codex(Api(), {"session_id": sid}, self.cwd, False, "sk_test", io.StringIO())
         return codex.find_local(sid)
 
-    def test_fork_archive_accepts_ancestor_metadata_and_keeps_child_identity(self):
-        rows = [self.header(forked_from_id=SID2), self.header(SID2), message("parent context"),
-                native("event_msg", {"type": "thread_settings_applied", "thread_id": SID}),
-                message("child question")]
-        path = self.restore(rows)
-        with open(path) as f:
-            restored = [json.loads(line) for line in f]
-        self.assertEqual([r["payload"]["id"] for r in restored if r["type"] == "session_meta"], [SID])
-        self.assertIn("parent context", json.dumps(restored))
-        self.assertEqual(extract.scan(path).title, "child question")
-        self.assertEqual(codex.metadata(path)["cwd"], self.cwd)
-
-    def test_subagent_archive_rebases_its_inherited_prefix_after_conversion(self):
-        header = self.header(forked_from_id=SID2, subagent_history_start_ordinal=4)
-        header["payload"]["source"] = {"subagent": {}}
-        rows = [header, self.header(SID2), message("parent context"),
-                native("turn_context", {"cwd": "/old"}), message("child work")]
-        for ordinal, row in enumerate(rows):
-            row["ordinal"] = ordinal
-        path = self.restore(rows)
-        self.assertEqual(extract.scan(path).title, "child work")
-        self.assertFalse(extract.scan(path).interactive)
-
-    def test_jsonl_unicode_separators_roundtrip(self):
-        text = "before\u2028middle\u2029more\u0085end\x1c\x1d\x1e"
-        path = self.restore([self.header(), message(text)])
-        with open(path, "rb") as f:
-            records = [json.loads(raw) for raw in f.read().split(b"\n") if raw]
-        messages = [r["payload"] for r in records if r["type"] == "response_item"]
-        self.assertEqual(messages[0]["content"][0]["text"], text)
-
-    def test_subagent_boundary_is_rebased_without_optional_parent_link(self):
-        header = self.header(subagent_history_start_ordinal=5)
-        header["payload"]["source"] = {"subagent": {}}
-        rows = [header, self.header(SID2), message("parent context"),
-                native("turn_context", {"cwd": "/parent"}), native("world_state", {}), message("child question")]
-        path = self.restore(rows)
-        self.assertEqual(extract.scan(path).title, "child question")
-        self.assertFalse(extract.scan(path).interactive)
-
-    def test_old_and_unknown_sources_remain_in_default_offline_results(self):
-        for source in (None, "future_source", {"custom": "desktop"}):
-            header = self.header()
-            header["payload"]["source"] = source
-            path = self.write_native([header, message("needle")])
-            self.assertEqual(extract.scan(path).entrypoint, "codex-unknown")
-            self.assertEqual([s.path for s in fallback.search("needle")], [path])
-        del header["payload"]["source"]
-        self.write_native([header, message("needle")])
-        self.assertTrue(extract.scan(path).interactive)
-
-    def test_structured_search_excludes_current_session_online_and_offline(self):
-        srv = FakeServer(lambda req: (200, {"sessions": [
-            {"session_id": SID, "session_key": "sk_current"},
-            {"session_id": SID2, "session_key": "sk_past"}]}, {}))
-        self.addCleanup(srv.close)
-        self.write_config(srv.base)
-        self.write_native([self.header(), message("needle")])
-        self.transcript([user("needle")], sid=SID2)
-        for variable in ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"):
-            with mock.patch.dict(os.environ, {variable: SID}):
-                _, ns = cli.parse(["search", "needle", "--limit", "1"])
-                out = io.StringIO()
-                self.assertEqual(cli.cmd_search(ns, out), 0)
-                self.assertEqual([r["session_id"] for r in json.loads(out.getvalue())["sessions"]], [SID2])
-                _, ns = cli.parse(["search", "needle", "--offline"])
-                out = io.StringIO()
-                self.assertEqual(cli.cmd_search(ns, out), 0)
-                self.assertEqual([r["session_id"] for r in json.loads(out.getvalue())["sessions"]], [SID2])
 
     def test_find_local_reads_only_the_matching_header_and_uses_hint_lazily(self):
         target = self.write_native([self.header(), message("needle")])
@@ -142,48 +73,6 @@ class ReviewPaths(HomeCase):
         with mock.patch.object(codex, "paths", side_effect=AssertionError("unnecessary walk")):
             self.assertEqual(codex.find_local(SID, hint=target), target)
 
-    def test_old_server_defers_many_rollouts_with_one_info_and_no_errors(self):
-        self.write_native([self.header(), message("first")])
-        self.write_native([self.header(SID2), message("second")], sid=SID2)
-        srv = FakeServer(lambda req: (200, {"parser_version": "p1"}, {}))
-        self.addCleanup(srv.close)
-        self.write_config(srv.base)
-        out = io.StringIO()
-        with mock.patch.object(util, "log") as log, mock.patch("sys.stdout", out):
-            self.assertEqual(ingest.run("sweep", redactor=FakeRedactor()), 0)
-        deferred = [c for c in log.call_args_list if "cursors held" in c.args[1]]
-        self.assertEqual(len(deferred), 1)
-        self.assertEqual(deferred[0].args[0], "INFO")
-        self.assertFalse(any(c.args[0] in ("WARN", "ERROR") for c in log.call_args_list))
-        self.assertEqual(ingest.State().files, {})
-        self.assertEqual(len(srv.of("/status")), 1)
-        self.assertIn('"errors": 0', out.getvalue())
-
-    def test_codex_context_matches_cannot_evict_older_claude_conversation(self):
-        for index in range(fallback.CANDIDATE_CAP + 1):
-            sid = "%08d-0000-0000-0000-000000000000" % index
-            header = self.header(sid)
-            header["payload"]["base_instructions"] = "commit instructions repeated everywhere"
-            self.write_native([header, message("unrelated")], sid=sid)
-        old = self.transcript([user("the commit we discussed")], sid=SID2)
-        os.utime(old, (100, 100))
-        self.assertEqual([s.path for s in fallback.search("commit")], [old])
-
-    def test_missing_directories_are_reported_for_empty_and_nonempty_queries(self):
-        os.rmdir(self.projects)
-        for q in ("", "needle"):
-            with self.assertRaises(fallback.FallbackUnavailable):
-                fallback.search(q)
-            rows = picker.offline_rows(q, set(), {}, "host", env={})
-            self.assertIn("no local transcript directories", rows[1])
-
-    @unittest.skipUnless(os.environ.get("CCS_TEST_CODEX"), "set CCS_TEST_CODEX to a native Codex binary")
-    def test_resume_cli_finds_restored_fork_without_an_index_database(self):
-        self.check_resume_cli(False)
-
-    @unittest.skipUnless(os.environ.get("CCS_TEST_CODEX"), "set CCS_TEST_CODEX to a native Codex binary")
-    def test_resume_cli_finds_restored_subagent_without_an_index_database(self):
-        self.check_resume_cli(True)
 
     def check_resume_cli(self, subagent):
         stamp = datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)

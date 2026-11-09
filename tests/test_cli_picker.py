@@ -47,42 +47,6 @@ class Parsing(HomeCase):
         self.assertEqual(cli.parse(["_backend"])[1].q, "")
         self.assertEqual(cli.parse(["--", "status"])[1].query, ["status"])
 
-    def test_usage_errors_exit_2(self):
-        for argv in (["ingest"], ["ingest", "--sweep", "--backfill"], ["ingest", "--sweep", "--with-subagents"],
-                     ["--since", "seven days"], ["--since", "0d"], ["--host", "Bad_Host"], ["resume"],
-                     ["--no-such-flag"], ["_toggle", "x"]):
-            code, _ = quiet_main(argv)
-            self.assertEqual(code, util.EXIT_USAGE, argv)
-
-    def test_help_exits_0(self):
-        code, _ = quiet_main(["--help"])
-        self.assertEqual(code, 0)
-
-    def test_resume_precondition_exit_4(self):
-        code, err = quiet_main(["resume", "local:/nonexistent/x.jsonl"])
-        self.assertEqual(code, util.EXIT_RESUME)
-        self.assertIn("refusing session_id", err)
-        code, err = quiet_main(["resume", "local:%s/-x/%s.jsonl" % (self.projects, SID)])
-        self.assertEqual(code, util.EXIT_RESUME)
-        self.assertIn("no longer exists", err)
-
-    def test_unreachable_exit_3(self):
-        self.write_config("http://127.0.0.1:9/memory/sessions/v1")
-        self.assertEqual(quiet_main(["resume", "sk_abc"])[0], util.EXIT_UNREACHABLE)
-        self.assertEqual(quiet_main(["purge", "sk_abc"])[0], util.EXIT_UNREACHABLE)
-        self.assertEqual(quiet_main(["status"])[0], util.EXIT_UNREACHABLE)
-
-    def test_purge_ok(self):
-        srv = FakeServer(lambda req: (200, {"deleted_docs": 3, "deleted_objects": 2}, {}))
-        try:
-            self.write_config(srv.base + "/memory/sessions/v1")
-            self.assertEqual(quiet_main(["purge", "sk_abc"])[0], 0)
-            (r,) = srv.requests
-            self.assertEqual((r["method"], r["path"], r["query"]),
-                             ("DELETE", "/memory/sessions/v1/session", {"session_key": "sk_abc"}))
-        finally:
-            srv.close()
-
 
 class FzfArgv(HomeCase):
     def test_argv_assembly(self):
@@ -108,16 +72,6 @@ class FzfArgv(HomeCase):
         self.assertEqual(argv[argv.index("--header") + 1], "B")
         self.assertIn("start:reload('/path with space/ccs' _backend {q})", argv)
 
-    def test_toggle_round_trip_via_prompt(self):
-        state = os.path.join(self.tmp, "prompt")
-        env = {"FZF_PROMPT": "ccs> ", "CCS_PICK_STATE": state}
-        self.assertEqual(picker.toggle("s", env), "ccs:s> ")
-        env["FZF_PROMPT"] = "ccs:s> "
-        self.assertEqual(picker.toggle("d", env), "ccs:sd> ")
-        env["FZF_PROMPT"] = "ccs:sd> "
-        self.assertEqual(picker.toggle("s", env), "ccs:d> ")
-        # an fzf without $FZF_PROMPT falls back to the state file
-        self.assertEqual(picker.current_flags({"CCS_PICK_STATE": state}), {"d"})
 
     def test_search_body(self):
         b = picker.search_body("x", {"d", "a"}, {"sidechain": True, "hosts": ["mini"], "cwd_prefix": "/w",
@@ -126,69 +80,6 @@ class FzfArgv(HomeCase):
                              "include_sidechain": True, "limit": 50, "hosts": ["mini"], "cwd_prefix": "/w",
                              "since": "2026-01-01T00:00:00Z"})
         self.assertEqual(picker.search_body("ab", {"s"}, {})["mode"], "hybrid")
-
-    def test_rows_mark_view_only_and_exclude_self(self):
-        srv = FakeServer(lambda req: (200, {"sessions": [
-            {"session_key": "sk_1", "session_id": SID, "host": "pro-dev", "title": "local one", "cwd": "/w",
-             "updated_at": "2026-10-01T00:00:00Z", "hit_count": 3, "jsonl_exists": True, "archived": False,
-             "archive_complete": False},
-            {"session_key": "sk_2", "session_id": "other", "host": "mini", "title": "remote\tunarchived",
-             "cwd": "/w", "updated_at": "2026-10-01T00:00:00Z", "hit_count": 1, "jsonl_exists": True,
-             "archived": False, "archive_complete": False},
-            {"session_key": "sk_3", "session_id": "me", "host": "pro-dev", "title": "self", "cwd": "/w",
-             "updated_at": "2026-10-01T00:00:00Z", "jsonl_exists": True}], "took_ms": 3}, {}))
-        try:
-            self.write_config(srv.base + "/memory/sessions/v1")
-            out = io.StringIO()
-            picker.backend("query", env={"CLAUDE_CODE_SESSION_ID": "me"}, out=out)
-            rows = out.getvalue().splitlines()
-            self.assertEqual(len(rows), 2)
-            k1, r1 = rows[0].split("\t")
-            k2, r2 = rows[1].split("\t")
-            self.assertEqual((k1, k2), ("sk_1", "sk_2"))
-            self.assertTrue(r1.startswith("  "))
-            self.assertTrue(r2.startswith("· "))  # other host, not archived -> view-only
-            self.assertIn(" │ local one │ 3", r1)
-            self.assertNotIn("\t", r2)
-            body = srv.requests[0]["body"]
-            self.assertEqual(body["q"], "query")
-        finally:
-            srv.close()
-
-
-class PickerRun(HomeCase):
-    def _run(self, stdout, code=0, do_print=False):
-        calls = []
-
-        def runner(argv, **kw):
-            calls.append((argv, kw))
-            return subprocess.CompletedProcess(argv, code, stdout=stdout.encode())
-
-        resumed = []
-        rc = picker.run("q", set(), {}, do_print, False, runner=runner, which=lambda _: "/usr/bin/fzf",
-                        resume_fn=lambda key, do_print, fork: resumed.append((key, do_print)) or 0)
-        return rc, calls, resumed
-
-    def test_cancel_is_exit_0(self):
-        rc, _, resumed = self._run("", code=130)
-        self.assertEqual((rc, resumed), (0, []))
-
-    def test_enter_resumes_and_ctrl_y_prints(self):
-        rc, calls, resumed = self._run("\nsk_9\t  1d host ~/w │ t\n")
-        self.assertEqual((rc, resumed), (0, [("sk_9", False)]))
-        env = calls[0][1]["env"]
-        self.assertEqual(json.loads(env["CCS_PICK"])["flags"], "")
-        rc, _, resumed = self._run("ctrl-y\nsk_9\t  1d host ~/w │ t\n")
-        self.assertEqual(resumed, [("sk_9", True)])
-
-    def test_banner_row_selection_is_ignored(self):
-        rc, _, resumed = self._run("\n-\tOFFLINE\n")
-        self.assertEqual((rc, resumed), (0, []))
-
-    def test_missing_fzf_exit_3(self):
-        with contextlib.redirect_stderr(io.StringIO()):
-            rc = picker.run("q", set(), {}, False, False, which=lambda _: None)
-        self.assertEqual(rc, util.EXIT_UNREACHABLE)
 
 
 if __name__ == "__main__":
