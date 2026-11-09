@@ -476,10 +476,17 @@ fn python_float(value: f64) -> String {
     let mut digits = mantissa.replace('.', "");
     let mut scale: i32 = exponent.parse::<i32>().unwrap() - digits.len() as i32 + 1;
     let mut integer: u128 = digits.parse().unwrap();
+    // At a power of two the rounding interval is asymmetric: an adjacent
+    // decimal at the midpoint is eligible only if it preserves this float.
+    let roundtrips = |candidate: u128| {
+        format!("{candidate}e{scale}")
+            .parse::<f64>()
+            .is_ok_and(|v| v == value.abs())
+    };
     if integer % 2 == 1 {
-        if midpoint(value, 2 * integer - 1, scale) {
+        if midpoint(value, 2 * integer - 1, scale) && roundtrips(integer - 1) {
             integer -= 1;
-        } else if midpoint(value, 2 * integer + 1, scale) {
+        } else if midpoint(value, 2 * integer + 1, scale) && roundtrips(integer + 1) {
             integer += 1;
         }
     }
