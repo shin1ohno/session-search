@@ -89,6 +89,42 @@ class AdapterShape(IngestCase):
         self.assertEqual(t, {"type": "session-search-tombstone", "reason": "unmasked_secret",
                              "kinds": ["aws-key"], "line_offset": 123})
 
+    def test_lone_surrogates_are_tombstoned_before_sending(self):
+        for bad in (user("poison\ud83d"), user("poison\udc00"),
+                    user("ok", nested={"poison\ud800": ["value"]}),
+                    user("ok", nested=[{"value": "poison\udfff"}])):
+            with self.subTest(record=ascii(bad)):
+                before, after = user("before 日本語"), assistant("after 😀")
+                p = self.transcript([before, bad, after])
+                # Reuse the file with a fresh local cursor for each case.
+                state = ingest.State()
+                state.files.pop(p, None)
+                state.save()
+                self.srv.requests.clear()
+                self.assertEqual(ingest.run("file", file_path=p, quiet=True,
+                                            redactor=FakeRedactor()), util.EXIT_OK)
+                (req,) = self.ingests()
+                seg = req["body"]["segment"]
+                self.assertEqual([json.loads(line) for line in seg["lines"]], [
+                    before, ingest.tombstone("surrogate", [], len(json.dumps(before)) + 1), after])
+                self.assertNotIn("poison", json.dumps(req["body"]))
+                payload = ("\n".join(seg["lines"]) + "\n").encode("utf-8")
+                self.assertEqual(seg["sha256"], hashlib.sha256(payload).hexdigest())
+                self.assertEqual(seg["end_offset"], os.path.getsize(p))
+                self.assertEqual(ingest.State().files[p]["offset"], os.path.getsize(p))
+                self.assertEqual(ingest.run("file", file_path=p, quiet=True,
+                                            redactor=FakeRedactor()), util.EXIT_OK)
+                self.assertEqual(len(self.ingests()), 1)
+                with open(util.log_path()) as fh:
+                    self.assertNotIn("poison", fh.read())
+
+    def test_valid_surrogate_pair_is_sent_as_unicode(self):
+        p = self.transcript([user("😀 日本語")])
+        self.assertEqual(ingest.run("file", file_path=p, quiet=True,
+                                    redactor=FakeRedactor()), util.EXIT_OK)
+        (req,) = self.ingests()
+        self.assertEqual(json.loads(req["body"]["segment"]["lines"][0]), user("😀 日本語"))
+
 
 class DiffRule(IngestCase):
     def test_partial_trailing_line_waits(self):
