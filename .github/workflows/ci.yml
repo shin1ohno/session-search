@@ -31,6 +31,7 @@ jobs:
           python3 tools/test_foundation.py
           python3 tools/test_crosscheck.py
           python3 tools/test_lock.py target/release/examples/lock_probe
+          python3 tools/test_workflow.py
   dependency-policy:
     runs-on: ubuntu-22.04
     steps:
@@ -45,6 +46,7 @@ jobs:
           key: cargo-deny-0.20.2-linux
       - run: command -v cargo-deny || cargo install --locked --version 0.20.2 cargo-deny
       - run: python3 tools/check_dependencies.py
+      - run: python3 tools/test_dependency_inventory.py
       - run: cargo deny --locked check
       - run: python3 tools/test_dependency_policy.py
   weekly-audit:
