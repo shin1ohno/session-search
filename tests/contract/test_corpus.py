@@ -19,6 +19,11 @@ class CorpusProvenance(unittest.TestCase):
                 module = (VENDOR / ("session_" + name + ".py")).read_bytes()
                 oracle_oid = hashlib.sha1(b"blob " + str(len(module)).encode() + b"\0" + module).hexdigest()
                 self.assertEqual(header["source_blob"], oracle_oid)
+                if name == "redact":
+                    client = (VENDOR.parents[1] / "ccs/ingest.py").read_bytes()
+                    client_oid = hashlib.sha1(b"blob " + str(len(client)).encode() + b"\0" + client).hexdigest()
+                    self.assertEqual(header["client_source_blob"], client_oid)
+                    self.assertEqual(header["client_source"].encode(), client)
                 self.assertEqual(header["format"], "ccs-%s-conformance/1" % name)
                 self.assertGreaterEqual(header["min_vectors"], minimum)
                 self.assertGreaterEqual(header["vectors"], header["min_vectors"])

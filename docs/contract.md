@@ -121,15 +121,19 @@ the real `session_redact.py` and `session_codex.py` implementations.
 
 The JSONL header records `format`, `ruleset`, `source_blob`, Python/Unicode versions,
 fixed `hmac_key_hex`, seed, minimum/count and SHA256 of every subsequent byte.
-The redactor header also identifies the client ingest oracle blob. The generator
+The redactor header contains the exact client `ingest.py` source and its blob,
+and identifies the server parser blob. Standalone server replay extracts the
+real frozen `_mask_line`/`_mask_chunk` methods; it does not reproduce their logic.
+`--client-tree` additionally checks the live client blob; client CI always
+checks it against this checkout's `ccs/ingest.py`. The generator
 uses Python 3.13.5 / Unicode 15.1.0, seed 20261109 and public test key
 `test-key-not-a-secret`. This identifies the generation interpreter, not an
 unverified claim about a running host. Each vector has `id`, `op`, `input`,
 `expect`; the only compression syntax is `{"$repeat":[string,count]}`. Comparisons
 preserve JSON types and dictionary key order.
 
-The r1 corpus contains 54,175 vectors (18,504,724 bytes), and v1 Codex contains
-109 (80,454 bytes). The 2 MiB planning target is exceeded: the full required
+The r1 corpus contains 54,319 vectors (18,636,639 bytes), and v1 Codex contains
+154 (149,457 bytes). The 2 MiB planning target is exceeded: the full required
 Cartesian boundary coverage and legacy budget cases are retained instead of
 discarding cases or introducing a new compression format. The committed corpus
 is finite evidence, not proof of redactor equivalence for arbitrary input.
@@ -139,7 +143,7 @@ Cartesian boundaries for the seven word-boundary rules, Unicode case/space,
 placeholder/fixed-point/prefilter behavior, secret keys and collision suffixes,
 record budgets and depth through 64, and legacy in-domain vectors. Lone surrogates
 and deeper values belong to the raw `mask_line` path, whose expected values come
-from the actual baseline client, including depths 63–66, special serde keys,
+from the actual baseline client, including object-root depths 63–66 and 127–130, whitespace-only skip, special serde keys,
 invalid UTF-8 and JSON grammar edges. Codex normalization compares only fields
 consumed by the client: type, message.content, cwd, entrypoint, timestamp,
 gitBranch and version. Generated uuid/message.id remain server unit-test scope.
@@ -153,12 +157,23 @@ python3 -I memory-mcp/test_session_redact_conformance.py
 python3 -I memory-mcp/test_session_codex_conformance.py
 ```
 
-The server runner validates source blob, vector count/minimum, body hash, IDs and
-expectations. For negative control N8, change exactly one character in an `expect`
-string in a scratch copy, update the header body hash, and pass that file to the
-corresponding Python runner. It must identify the vector and exit 1; a checksum
-error alone is insufficient. Rust's equivalent is deferred to S2. Client
-`test_corpus.py` independently checks provenance/count/hash against vendor bytes.
+The server runner validates source blobs, vector count/minimum, body hash, IDs,
+Python expectations and the separate bounded D2/D3 line contract. Every normal
+runner invocation also executes N8 in a scratch copy: one expected character is
+changed, the body checksum is repaired, and the same runner must identify that
+vector and exit 1. `--no-n8` is used only by that child to prevent recursion.
+Thus the existing ai-memory CI runs N8 for both corpora (plan section 3.5); a
+checksum error or environment failure is not accepted as the negative control.
+Rust's runner remains S2. Client `test_corpus.py` independently checks vendor
+provenance/count/hash and the live client source.
+
+The Rust masking loop must iterate to a fixed point with the same
+`_MAX_PASSES = 8` limit as the real Python rules. The corpus now rejects a
+one-pass loop. A two-pass mutant remains an unresolved survivor: constructed
+overlap/chaining searches have not yet found an input needing three passes.
+This is a disclosed coverage gap, not evidence of equivalence or permission
+to shorten the Rust loop. The task mutation audit records the search count and
+survivor explicitly; S2 must retain the full loop and revisit this gap.
 
 ## Existing-test migration
 
@@ -189,8 +204,11 @@ tests and one provenance test bring the S0 contract suite to 102 tests. With the
 Merge the ai-memory corpus first, then the session-search vendor/contract PR, then
 setup's server-copy and pin PR, following setup ADR 0014 section on shared server
 modules. Setup's `ai-memory.pin` must name a commit already on ai-memory main, and
-all mapped copies must match its mode/OID. Refresh the SOURCE commit after a
-squash merge if needed. Do not manufacture a main ancestor or weaken the check.
+all mapped copies must match its mode/OID. In SOURCE, the recorded blob OID is
+the content authority. The commit is the import branch's historical provenance;
+it is not a main ancestor and becomes orphaned from main's history after a squash.
+A squash preserves the blob. Do not treat that recorded commit as a deploy pin
+or manufacture a main ancestor or weaken the check.
 The initial A1 session-search pin can use the already merged baseline commit.
 
 R0 reverts this contract PR and setup's separate corpus/ai-memory-pin commit.
