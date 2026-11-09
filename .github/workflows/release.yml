@@ -1,0 +1,106 @@
+name: release
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+  build:
+    needs: ci
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    env:
+      CCS_BUILD_COMMIT: ${{ github.sha }}
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned Rust and target
+        run: rustup toolchain install 1.99.1 --profile minimal && rustup target add --toolchain 1.99.1 '${{ matrix.target }}'
+      - name: Build and exercise the publication gate
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          cargo build --locked --release --target "$TARGET" --examples
+          cargo build --locked --release --target "$TARGET" --bin ccs
+          cp "target/$TARGET/release/ccs" "artifact/ccs-$TARGET"
+          cp "target/$TARGET/release/examples/lock_probe" artifact/lock_probe
+          artifact/ccs-"$TARGET" _buildinfo | tee artifact/buildinfo.json
+          python3 tools/test_lock.py artifact/lock_probe | tee artifact/lock.log
+          bash tools/stage_release.sh "artifact/ccs-$TARGET" "$GITHUB_SHA" "$TARGET" artifact
+          if [ "$(uname -s)" = Darwin ]; then
+            otool -l "artifact/ccs-$TARGET" > artifact/load-commands.log
+            awk '/cmd LC_BUILD_VERSION/ { build=1; next } build && /minos/ { print; if ($2 != "11.0") exit 1; found=1; exit } END { if (!found) exit 1 }' artifact/load-commands.log
+            codesign --verify --strict --verbose=2 "artifact/ccs-$TARGET" 2> artifact/signature.log
+            codesign -dv --verbose=4 "artifact/ccs-$TARGET" 2>> artifact/signature.log
+          fi
+          shasum -a 256 "artifact/ccs-$TARGET" > artifact/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: ccs-${{ matrix.target }}
+          path: artifact/
+  release-check:
+    needs: [ci, build]
+    runs-on: ubuntu-22.04
+    outputs:
+      ready: ${{ steps.gate.outputs.ready }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: ccs-*
+          path: artifacts
+      - id: gate
+        run: |
+          set -euo pipefail
+          ready=true
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
+            test -f "artifacts/ccs-$target/ccs-$target"
+            if ! test -f "artifacts/ccs-$target/ready"; then ready=false; fi
+          done
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+          echo "Publication eligibility: $ready"
+  publish:
+    needs: [ci, build, release-check]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.release-check.outputs.ready == 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: ccs-*
+          path: artifacts
+      - name: Stage only release binaries
+        run: |
+          mkdir release
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
+            cp "artifacts/ccs-$target/ccs-$target" release/
+          done
+          (cd release && sha256sum ccs-* > SHA256SUMS)
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: release/ccs-*
+      - name: Publish verified main commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "ccs-$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "ccs $GITHUB_SHA" release/*

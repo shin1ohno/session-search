@@ -1,17 +1,70 @@
 name: ci
 
 on:
+  workflow_call:
+  workflow_dispatch:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: '17 2 * * 1'
 
 permissions:
   contents: read
 
 jobs:
+  rust:
+    runs-on: ubuntu-22.04
+    env:
+      CCS_BUILD_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+      - run: cargo fmt --check --all
+      - run: cargo build --locked --workspace
+      - run: cargo test --locked --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo build --locked --release --workspace --examples && cargo build --locked --release --bin ccs
+      - name: Foundation, cross-check and locking gates
+        run: |
+          python3 tools/test_foundation.py
+          python3 tools/test_crosscheck.py
+          python3 tools/test_lock.py target/release/examples/lock_probe
+          python3 tools/test_workflow.py
+  dependency-policy:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: rustup toolchain install 1.99.1 --profile minimal
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-0.20.2-linux
+      - run: command -v cargo-deny || cargo install --locked --version 0.20.2 cargo-deny
+      - run: python3 tools/check_dependencies.py
+      - run: python3 tools/test_dependency_inventory.py
+      - run: cargo deny --locked check
+      - run: python3 tools/test_dependency_policy.py
+  weekly-audit:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.99.1 --profile minimal
+      - run: cargo install --locked --version 0.22.2 cargo-audit
+      - run: cargo audit
   test-python3:
+    # Preserve the existing required context while also requiring Rust/policy.
+    needs: [rust, dependency-policy]
+    if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Require Rust and dependency-policy success
+        run: test '${{ needs.rust.result }}' = success && test '${{ needs.dependency-policy.result }}' = success
       - uses: actions/checkout@v4
 
       - name: ccs client suite (runner python3)

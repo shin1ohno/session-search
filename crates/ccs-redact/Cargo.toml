@@ -1,0 +1,12 @@
+[package]
+name = "ccs-redact"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ccs-pytext.workspace = true
+regex-automata.workspace = true
+ring.workspace = true

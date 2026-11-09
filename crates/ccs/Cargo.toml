@@ -1,0 +1,22 @@
+[package]
+name = "ccs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ccs-pytext.workspace = true
+ccs-redact.workspace = true
+regex.workspace = true
+ring.workspace = true
+ureq.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+flate2.workspace = true
+tar.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+libc.workspace = true
+base64.workspace = true

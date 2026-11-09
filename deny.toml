@@ -1,0 +1,72 @@
+# Dependency edges are explicit: ccs-redact is a wrapper only for its three approved dependencies.
+# tools/check_dependencies.py also rejects unlisted crates and altered direct edges.
+[graph]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]
+[advisories]
+[licenses]
+allow = ["MIT", "Apache-2.0", "ISC", "BSD-3-Clause", "CC0-1.0", "Unicode-3.0", "Zlib", "CDLA-Permissive-2.0"]
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+  { crate = "serde_json", reason = "JSON goes through ccs-pytext::json" },
+  { crate = "adler2", wrappers = ["miniz_oxide", "simd-adler32"] },
+  { crate = "aho-corasick", wrappers = ["regex", "regex-automata"] },
+  { crate = "anstyle", wrappers = ["clap_builder"] },
+  { crate = "base64", wrappers = ["ccs", "rustls", "rustls-webpki", "ureq", "ureq-proto"] },
+  { crate = "bytes", wrappers = ["http"] },
+  { crate = "cc", wrappers = ["ring"] },
+  { crate = "ccs-redact", wrappers = ["ccs"] },
+  { crate = "cfg-if", wrappers = ["crc32fast", "filetime", "getrandom", "ring"] },
+  { crate = "clap", wrappers = ["base64", "ccs", "clap_complete"] },
+  { crate = "clap_builder", wrappers = ["clap"] },
+  { crate = "clap_complete", wrappers = ["ccs"] },
+  { crate = "clap_lex", wrappers = ["clap_builder", "clap_complete"] },
+  { crate = "crc32fast", wrappers = ["flate2", "zlib-rs"] },
+  { crate = "filetime", wrappers = ["tar"] },
+  { crate = "find-msvc-tools", wrappers = ["cc"] },
+  { crate = "flate2", wrappers = ["ccs", "ureq"] },
+  { crate = "getrandom", wrappers = ["ring", "ureq"] },
+  { crate = "http", wrappers = ["ureq-proto"] },
+  { crate = "httparse", wrappers = ["ureq-proto"] },
+  { crate = "itoa", wrappers = ["http"] },
+  { crate = "libc", wrappers = ["cc", "ccs", "filetime", "getrandom", "ring", "tar"] },
+  { crate = "log", wrappers = ["aho-corasick", "memchr", "regex-automata", "rustls", "ureq", "ureq-proto"] },
+  { crate = "memchr", wrappers = ["aho-corasick", "regex", "regex-automata"] },
+  { crate = "miniz_oxide", wrappers = ["flate2"] },
+  { crate = "once_cell", wrappers = ["rustls", "rustls-webpki"] },
+  { crate = "percent-encoding", wrappers = ["ureq", "webpki-roots"] },
+  { crate = "regex", wrappers = ["ccs", "once_cell"] },
+  { crate = "regex-syntax", wrappers = ["regex", "regex-automata"] },
+  { crate = "rustls", wrappers = ["ccs", "ureq", "webpki-roots"] },
+  { crate = "rustls-pki-types", wrappers = ["rustls", "rustls-webpki", "ureq", "webpki-roots"] },
+  { crate = "rustls-webpki", wrappers = ["rustls", "webpki-roots"] },
+  { crate = "shlex", wrappers = ["cc", "clap", "clap_complete"] },
+  { crate = "simd-adler32", wrappers = ["miniz_oxide"] },
+  { crate = "subtle", wrappers = ["rustls"] },
+  { crate = "tar", wrappers = ["ccs"] },
+  { crate = "untrusted", wrappers = ["ring", "rustls-webpki"] },
+  { crate = "ureq", wrappers = ["ccs"] },
+  { crate = "ureq-proto", wrappers = ["ureq"] },
+  { crate = "utf8-zero", wrappers = ["ureq"] },
+  { crate = "wasi", wrappers = ["getrandom"] },
+  { crate = "webpki-roots", wrappers = ["ccs", "rustls", "ureq"] },
+  { crate = "windows-sys", wrappers = ["ring"] },
+  { crate = "windows-targets", wrappers = ["windows-sys"] },
+  { crate = "windows_aarch64_gnullvm", wrappers = ["windows-targets"] },
+  { crate = "windows_aarch64_msvc", wrappers = ["windows-targets"] },
+  { crate = "windows_i686_gnu", wrappers = ["windows-targets"] },
+  { crate = "windows_i686_gnullvm", wrappers = ["windows-targets"] },
+  { crate = "windows_i686_msvc", wrappers = ["windows-targets"] },
+  { crate = "windows_x86_64_gnu", wrappers = ["windows-targets"] },
+  { crate = "windows_x86_64_gnullvm", wrappers = ["windows-targets"] },
+  { crate = "windows_x86_64_msvc", wrappers = ["windows-targets"] },
+  { crate = "zeroize", wrappers = ["rustls", "rustls-pki-types"] },
+  { crate = "zlib-rs", wrappers = ["flate2", "rustls"] },
+]
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
