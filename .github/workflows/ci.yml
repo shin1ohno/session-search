@@ -16,8 +16,8 @@ jobs:
 
       - name: ccs client suite (runner python3)
         run: |
-          # Hermetic: a fake HTTP server on 127.0.0.1, a fake redactor with the
-          # frozen session_redact API, and a temp $HOME. ripgrep makes the
+          # Hermetic: a fake HTTP server on 127.0.0.1, the real vendored
+          # redactor, and a temp $HOME. ripgrep makes the
           # fallback cases run instead of skip; CCS_TEST_CODEX makes the
           # native Codex cases run instead of skip.
           sudo apt-get update -qq
@@ -25,6 +25,13 @@ jobs:
           npm install --prefix /tmp/ccs-test-codex --no-audit --no-fund @openai/codex@0.162.1
           codex_test_bin=$(find /tmp/ccs-test-codex/node_modules -type f -path '*/vendor/*/bin/codex' -print -quit)
           test -x "$codex_test_bin"
+          contract_stage="$RUNNER_TEMP/ccs-python-contract"
+          mkdir -p "$contract_stage"
+          cp -R ccs "$contract_stage/"
+          cp vendor/memory-mcp/session_redact.py vendor/memory-mcp/session_codex.py "$contract_stage/ccs/"
+          export PYTHONPATH="$contract_stage"
+          export CCS_UNDER_TEST="$(python3 -c 'import shlex, sys; print(shlex.join([sys.executable, "-m", "ccs"]))')"
+          python3 -c 'import os; print("CCS_UNDER_TEST=" + os.environ["CCS_UNDER_TEST"])'
           CCS_TEST_CODEX="$codex_test_bin" python3 -m unittest discover -s tests -v
 
   test-python39:
@@ -50,4 +57,11 @@ jobs:
       - name: ccs client suite (Python 3.9, the macOS system python)
         run: |
           python --version
+          contract_stage="$RUNNER_TEMP/ccs-python-contract"
+          mkdir -p "$contract_stage"
+          cp -R ccs "$contract_stage/"
+          cp vendor/memory-mcp/session_redact.py vendor/memory-mcp/session_codex.py "$contract_stage/ccs/"
+          export PYTHONPATH="$contract_stage"
+          export CCS_UNDER_TEST="$(python -c 'import shlex, sys; print(shlex.join([sys.executable, "-m", "ccs"]))')"
+          python -c 'import os; print("CCS_UNDER_TEST=" + os.environ["CCS_UNDER_TEST"])'
           python -W error::ResourceWarning -m unittest discover -s tests

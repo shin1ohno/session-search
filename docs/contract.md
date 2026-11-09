@@ -30,7 +30,12 @@ exercises the actual picker. It skips outside Linux x86_64/aarch64. This is test
 fault injection only. The ordinary helper tests run without that restriction.
 
 `test_state_interop.py` alternates writers and readers in both directions. In S0
-both commands are Python; S2 supplies Rust and Python with the two variables. A
+both commands are Python; S2 supplies Rust and Python with the two variables.
+Both Python CI jobs explicitly set
+`CCS_UNDER_TEST` to the current interpreter and a staged copy of the real client
+with the real server modules. This exercises S0's external-command contract
+(stage table, plan line 469). Section 3.5 (lines 280–293) requires the N8 CI
+negative control at S0; S1's CI change (line 470) is the later Rust build workflow. A
 passing S0 run does not establish Python/Rust interoperability.
 
 ## CLI and output
@@ -122,7 +127,11 @@ the real `session_redact.py` and `session_codex.py` implementations.
 The JSONL header records `format`, `ruleset`, `source_blob`, Python/Unicode versions,
 fixed `hmac_key_hex`, seed, minimum/count and SHA256 of every subsequent byte.
 The redactor header contains the exact client `ingest.py` source and its blob,
-and identifies the server parser blob. Standalone server replay extracts the
+and identifies only the selected `strict_load` functions/constants with a
+SHA256 fingerprint. Unrelated server definitions or line shifts do not alter
+that fingerprint. Changes to the selected parser dependencies invalidate it,
+and replay also checks the real parser's results for every raw-line vector.
+Standalone server replay extracts the
 real frozen `_mask_line`/`_mask_chunk` methods; it does not reproduce their logic.
 `--client-tree` additionally checks the live client blob; client CI always
 checks it against this checkout's `ccs/ingest.py`. The generator
@@ -132,7 +141,7 @@ unverified claim about a running host. Each vector has `id`, `op`, `input`,
 `expect`; the only compression syntax is `{"$repeat":[string,count]}`. Comparisons
 preserve JSON types and dictionary key order.
 
-The r1 corpus contains 54,338 vectors (18,640,991 bytes), and v1 Codex contains
+The r1 corpus contains 54,472 vectors (18,843,525 bytes), and v1 Codex contains
 154 (149,457 bytes). The 2 MiB planning target is exceeded: the full required
 Cartesian boundary coverage and legacy budget cases are retained instead of
 discarding cases or introducing a new compression format. The committed corpus
@@ -140,7 +149,7 @@ is finite evidence, not proof of redactor equivalence for arbitrary input.
 
 Redactor coverage includes all four functions, the 47 boundary characters,
 Cartesian boundaries for the seven word-boundary rules, Unicode case/space,
-placeholder/fixed-point/prefilter behavior, secret keys and collision suffixes,
+placeholder/pass-limit/prefilter behavior, secret keys and collision suffixes,
 record budgets and depth through 64, and legacy in-domain vectors. Lone surrogates
 and deeper values belong to the raw `mask_line` path, whose expected values come
 from the actual baseline client, including object-root depths 63–66 and 127–130, whitespace-only skip, special serde keys,
@@ -167,13 +176,10 @@ checksum error or environment failure is not accepted as the negative control.
 Rust's runner remains S2. Client `test_corpus.py` independently checks vendor
 provenance/count/hash and the live client source.
 
-The Rust masking loop must iterate to a fixed point with the same
-`_MAX_PASSES = 8` limit as the real Python rules. The corpus now rejects a
-one-pass loop. A two-pass mutant remains an unresolved survivor: constructed
-overlap/chaining searches have not yet found an input needing three passes.
-This is a disclosed coverage gap, not evidence of equivalence or permission
-to shorten the Rust loop. The task mutation audit records the search count and
-survivor explicitly; S2 must retain the full loop and revisit this gap.
+The pass limit is 8. The result after the last pass is returned even when it
+is not a fixed point. Rust must reproduce that result exactly, including the
+existing early stop when a pass leaves the value unchanged. The corpus tests
+limits 2, 3, 4, 7 and 9 against the real Python implementation.
 
 ## Existing-test migration
 

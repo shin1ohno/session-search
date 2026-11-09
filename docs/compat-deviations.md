@@ -34,3 +34,10 @@ neither is an allowed exception or a skip. Valid surrogate pairs, depths <=64,
 NaN/Infinity, malformed JSON and non-object roots do not receive a blanket D3
 waiver. Rust-specific execution remains S2; S0 freezes and validates the data
 and exercises these deliberately incorrect policy outputs in its mutation audit.
+
+The raw-line boundary cases include positive and negative integers of 999,
+1,000, 1,001, 4,299, 4,300 and 4,301 digits. The sign does not count toward
+the digit limit. Lone surrogates in object keys count even when the value
+has none; valid paired escapes remain Unicode. When multiple guards apply,
+the contract priority is surrogate, then depth, then integer digit limit.
+Mixed cases assert the exact reason, empty kinds/counts and original offset.

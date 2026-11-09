@@ -10,12 +10,12 @@ blob: a267890c0b118caf41dfab83494c74da2b928d40
 vendored-as: vendor/memory-mcp/session_codex.py
 
 repo: https://github.com/shin1ohno/ai-memory
-commit: 704016f375d1d07e7820cafc7f1372ad2ca639b3
+commit: 572645dbf24d474efdae41050e60a75af1c2b6b8
 # Blob OIDs are authoritative. This branch commit is historical provenance;
 # a squash merge orphans it from main history while preserving the blobs.
 
 path: memory-mcp/conformance/session_redact_r1.jsonl
-blob: 75bc5d5370a15a704606c0f9cba3ad225481cf8e
+blob: fa476b85cb724b99a0d47c17ebaf65be39cfd60d
 vendored-as: vendor/memory-mcp/conformance/session_redact_r1.jsonl
 
 path: memory-mcp/conformance/session_codex_v1.jsonl
