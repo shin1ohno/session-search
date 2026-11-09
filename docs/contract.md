@@ -132,7 +132,7 @@ unverified claim about a running host. Each vector has `id`, `op`, `input`,
 `expect`; the only compression syntax is `{"$repeat":[string,count]}`. Comparisons
 preserve JSON types and dictionary key order.
 
-The r1 corpus contains 54,319 vectors (18,636,639 bytes), and v1 Codex contains
+The r1 corpus contains 54,338 vectors (18,640,991 bytes), and v1 Codex contains
 154 (149,457 bytes). The 2 MiB planning target is exceeded: the full required
 Cartesian boundary coverage and legacy budget cases are retained instead of
 discarding cases or introducing a new compression format. The committed corpus
