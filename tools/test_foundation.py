@@ -21,6 +21,12 @@ assert p.returncode == 1 and 'not implemented in S1' in p.stderr
 print(p.stderr.strip())
 print("PASS publication gate refuses skeleton")
 with tempfile.TemporaryDirectory() as work:
+    ready = Path(work) / "ready"
+    ready.touch()
+    subprocess.run(["bash", str(root / "tools/stage_release.sh"), str(binary),
+                    info["commit"], info["target"], work], check=True)
+    assert not ready.exists()
+    print("PASS negative: stale publication marker removed after refused gate")
     # A fake executable claims every suite passed but emits no vectors.
     fake = Path(work) / "ccs"
     fake.write_text('#!/bin/sh\nif [ "$1" = _buildinfo ]; then\ncat <<\'JSON\'\n' + json.dumps(info) + '\nJSON\nfi\n')

@@ -22,10 +22,11 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
     runs-on: ${{ matrix.runner }}
     env:
       CCS_BUILD_COMMIT: ${{ github.sha }}
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Rust and target
@@ -42,14 +43,10 @@ jobs:
           cp "target/$TARGET/release/examples/lock_probe" artifact/lock_probe
           artifact/ccs-"$TARGET" _buildinfo | tee artifact/buildinfo.json
           python3 tools/test_lock.py artifact/lock_probe | tee artifact/lock.log
-          if python3 tools/release_gate.py "artifact/ccs-$TARGET" "$GITHUB_SHA" "$TARGET" > artifact/gate.log 2>&1; then
-            touch artifact/ready
-          else
-            cat artifact/gate.log
-            grep -Fx 'ccs: conformance is not implemented in S1' artifact/gate.log
-            echo 'PASS negative: publication gate refused the S1 skeleton' | tee artifact/refused.log
-          fi
+          bash tools/stage_release.sh "artifact/ccs-$TARGET" "$GITHUB_SHA" "$TARGET" artifact
           if [ "$(uname -s)" = Darwin ]; then
+            otool -l "artifact/ccs-$TARGET" > artifact/load-commands.log
+            awk '/cmd LC_BUILD_VERSION/ { build=1; next } build && /minos/ { print; if ($2 != "11.0") exit 1; found=1; exit } END { if (!found) exit 1 }' artifact/load-commands.log
             codesign --verify --strict --verbose=2 "artifact/ccs-$TARGET" 2> artifact/signature.log
             codesign -dv --verbose=4 "artifact/ccs-$TARGET" 2>> artifact/signature.log
           fi

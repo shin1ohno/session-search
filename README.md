@@ -17,6 +17,8 @@ target/release/ccs _buildinfo
 ```
 
 `release.yml` builds Linux x86_64, Linux aarch64 and macOS aarch64 artifacts.
+The macOS build uses `macos-15` with an explicit macOS 11.0 deployment target;
+CI checks the binary's `LC_BUILD_VERSION` and its ad-hoc signature.
 PRs and manual runs only upload workflow artifacts. Publication on main also
 requires both conformance suites and the output cross-check, so S1 publishes
 nothing. See [the publication gate](tools/release_gate.py).
