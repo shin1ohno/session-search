@@ -15,6 +15,7 @@ p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('artifacts',type=Path)
 p.add_argument('--only',nargs='*')
 a=p.parse_args()
+a.artifacts=a.artifacts.resolve()
 a.artifacts.mkdir(parents=True,exist_ok=True)
 copy=a.artifacts/'negative-source'
 if copy.exists(): shutil.rmtree(copy)
@@ -29,7 +30,9 @@ libpath=copy/'crates/ccs-redact/src/lib.rs'
 tablepath=copy/'crates/ccs-redact/src/tables.rs'
 original=libpath.read_text()
 tables=tablepath.read_text()
-env=dict(os.environ,CCS_BUILD_COMMIT=subprocess.check_output(['git','-C',str(ROOT),'rev-parse','HEAD'],text=True).strip(),CARGO_TARGET_DIR=str(ROOT/'target'))
+# Cargo fingerprints can reuse a same-name path crate from a different copied
+# workspace. Keep this workspace's target directory separate from rule mutants.
+env=dict(os.environ,CCS_BUILD_COMMIT=subprocess.check_output(['git','-C',str(ROOT),'rev-parse','HEAD'],text=True).strip(),CARGO_TARGET_DIR=str(a.artifacts/'negative-target'))
 corpus=ROOT/'vendor/memory-mcp/conformance/session_redact_r1.jsonl'
 with corpus.open() as f: corpus_count=json.loads(next(f))['vectors']
 
@@ -160,7 +163,7 @@ for name in controls:
     s,t=mutate(name);libpath.write_text(s);tablepath.write_text(t)
     with (a.artifacts/(name+'-build.log')).open('w') as log:
         subprocess.run(['cargo','build','--locked','--profile','testmut','--bin','ccs'],cwd=copy,env=env,stdout=log,stderr=subprocess.STDOUT,check=True)
-    binary=ROOT/'target/testmut/ccs'
+    binary=Path(env['CARGO_TARGET_DIR'])/'testmut/ccs'
     gate_failures={}
     review_cases={'JSON-low-surrogate':'surrogate-last','CAP-name-bytes':'key-chars-',
                   'CAP-value-bytes':'value-chars-','CAP-record-bytes':'record-',

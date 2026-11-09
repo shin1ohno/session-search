@@ -11,12 +11,14 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+from regressions import records, lines
 
 ROOT=Path(__file__).resolve().parents[2]
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('artifacts',type=Path)
 p.add_argument('--mutants',type=Path,required=True)
 a=p.parse_args()
+a.artifacts=a.artifacts.resolve()
 a.artifacts.mkdir(parents=True,exist_ok=True)
 copy=a.artifacts/'mutation-source'
 if copy.exists(): shutil.rmtree(copy)
@@ -58,12 +60,13 @@ pub fn selected() -> Option<&'static Mutation> {
 ''')
 env=dict(os.environ)
 env['CCS_BUILD_COMMIT']=subprocess.check_output(['git','-C',str(ROOT),'rev-parse','HEAD'],text=True).strip()
-# Share immutable dependency cache; preserve the actual product binary first.
+# A distinct target prevents Cargo from reusing a path crate from the separate
+# negative-control workspace, even when the package name/version are identical.
 shutil.copy2(ROOT/'target/release/ccs',a.artifacts/'ccs-baseline')
-env['CARGO_TARGET_DIR']=str(ROOT/'target')
+env['CARGO_TARGET_DIR']=str(a.artifacts/'mutation-target')
 with (a.artifacts/'mutation-build.log').open('w') as log:
     subprocess.run(['cargo','build','--locked','--profile','testmut','--bin','ccs-rule-mutants'],cwd=copy,env=env,stdout=log,stderr=subprocess.STDOUT,check=True)
-shutil.copy2(ROOT/'target/testmut/ccs-rule-mutants',a.artifacts/'ccs-mutants')
+shutil.copy2(Path(env['CARGO_TARGET_DIR'])/'testmut/ccs-rule-mutants',a.artifacts/'ccs-mutants')
 print('PASS isolated generated mutant build:',len(rows),'alternatives')
 # The selector-free test build must still be the current product before any
 # mutant is selected. This also catches stale path-crate build-cache reuse.
@@ -71,9 +74,17 @@ probe=[{'mode':'json','input':r'{"x":"\ud800\udfff"}'},
        {'mode':'json','input':r'{"url":"https:\/\/u:passw0rd@h"}'},
        {'mode':'json','input':'{"x":5.960464477539063e-08}'},
        {'mode':'record','input':{'K'*40+'secret'+'K'*40:'abcdefghij'}}]
+probe += [{'mode':'record','input':value} for _,value in records()]
+probe += [{'mode':'line','hex':value.hex(),'off':1} for _,value in lines()]
+# This generated alternative expands the opening '[' class to include '\\'.
+probe += [{'mode':'spans','rule':'placeholder','input':r'\REDACTED:bearer]'}]
 payload=''.join(json.dumps(row)+'\n' for row in probe).encode()
 probe_env=dict(os.environ);probe_env.pop('CCS_TEST_MUTANT',None)
-def output(program):
-    return subprocess.check_output([program,'_conformance','redact','--requests'],input=payload,env=probe_env)
+def output(program,env=probe_env,data=payload):
+    return subprocess.check_output([program,'_conformance','redact','--requests'],input=data,env=env)
 assert output(a.artifacts/'ccs-baseline')==output(a.artifacts/'ccs-mutants'),'test build differs without a selected mutation'
-print('PASS test build baseline parity on JSON and Unicode key boundaries')
+print('PASS test build baseline parity on JSON and all named record/line boundaries',flush=True)
+selected=next(i for i,m in enumerate(mutants['mutants']) if m['mutant']=='placeholder placeholder[0] add-next')
+witness=(json.dumps(probe[-1])+'\n').encode()
+assert output(a.artifacts/'ccs-mutants',dict(probe_env,CCS_TEST_MUTANT=str(selected)),witness)!=output(a.artifacts/'ccs-baseline',data=witness),'selected mutation has no observed effect'
+print('PASS selected rule mutation changes observed output',flush=True)
