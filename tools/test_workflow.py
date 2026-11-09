@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check CI/release action pins and propagate release shell producer failures."""
+"""Check every workflow's action pins and release shell producer failures."""
 import json
 import os
 from pathlib import Path
@@ -11,14 +11,29 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 workflow = (root / ".github/workflows/release.yml").read_text()
-for name in ("ci.yml", "release.yml"):
-    content = (root / ".github/workflows" / name).read_text()
-    actions = [action for action in re.findall(r"^\s*(?:-\s*)?uses:\s+([^\s#]+)", content, re.MULTILINE)
-               if not action.startswith("./")]
-    assert actions, name + ": no external actions found"
-    for action in actions:
-        assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", action), name + ": action is not pinned to a commit: " + action
-    print("PASS", name, "external action pins:", len(actions))
+workflow_dir = root / ".github/workflows"
+paths = sorted([*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")])
+assert paths, "no workflows found"
+# Recognize block keys, quoted keys/values and single-entry flow mappings.
+# Other syntax containing uses must fail closed rather than escape the scan.
+use_line = re.compile(r'''\s*(?:-\s*)?(?:\{\s*)?(?:uses|"uses"|'uses')\s*:\s*(?:"([^"]+)"|'([^']+)'|([^\s,}#]+))\s*(?:\}\s*)?(?:#.*)?''')
+total_actions = 0
+for path in paths:
+    actions = 0
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        if "uses" not in line:
+            continue
+        location = path.name + ":" + str(number)
+        match = use_line.fullmatch(line)
+        assert match, location + ": unrecognized uses syntax: " + line.strip()
+        action = next(value for value in match.groups() if value is not None)
+        if action.startswith("./"):
+            continue  # Local references use the same checked-out commit.
+        assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", action), location + ": action is not pinned to a commit: " + action
+        actions += 1
+    total_actions += actions
+    print("PASS", path.name, "external action pins:", actions)
+assert total_actions, "no external actions found"
 step = workflow.split(
     "      - name: Build and exercise the publication gate\n", 1)[1].split("      - uses:", 1)[0]
 body = step.split("        run: |\n", 1)[1]
