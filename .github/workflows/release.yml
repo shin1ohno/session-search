@@ -79,13 +79,18 @@ jobs:
           echo "Publication eligibility: $ready"
   publish:
     needs: [ci, build, release-check]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.release-check.outputs.ready == 'true'
+    if: vars.CCS_RELEASE_ENABLED == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.release-check.outputs.ready == 'true'
     runs-on: ubuntu-22.04
     permissions:
       contents: write
       id-token: write
       attestations: write
     steps:
+      - name: Require exact release enablement
+        env:
+          RELEASE_ENABLED: ${{ vars.CCS_RELEASE_ENABLED }}
+        shell: bash
+        run: test "$RELEASE_ENABLED" = true
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: ccs-*
