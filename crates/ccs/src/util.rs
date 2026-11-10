@@ -3,6 +3,7 @@ use crate::errors::{Error, Result};
 use ccs_pytext::json::{self, Value};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -87,9 +88,44 @@ pub fn json_string(v: &Value, ascii: bool, sorted: bool) -> Result<String> {
 }
 
 pub fn home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+    let home = std::env::var_os("HOME").or_else(|| {
+        let mut size = 4096;
+        loop {
+            let mut buffer = vec![0_u8; size];
+            let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+            let mut result = std::ptr::null_mut();
+            // SAFETY: buffers and result storage remain live during getpwuid_r.
+            let error = unsafe {
+                libc::getpwuid_r(
+                    libc::getuid(),
+                    pwd.as_mut_ptr(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    &mut result,
+                )
+            };
+            if error == libc::ERANGE {
+                size *= 2;
+                continue;
+            }
+            if error != 0 || result.is_null() {
+                return None;
+            }
+            // SAFETY: successful getpwuid_r initialized pwd and its NUL-terminated pw_dir.
+            let bytes = unsafe { std::ffi::CStr::from_ptr(pwd.assume_init().pw_dir) }.to_bytes();
+            return Some(std::ffi::OsString::from_vec(bytes.to_vec()));
+        }
+    });
+    let Some(home) = home else {
+        return PathBuf::from("~");
+    };
+    let bytes = home.as_bytes();
+    let end = bytes.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1);
+    if end == 0 {
+        PathBuf::from("/")
+    } else {
+        PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..end]))
+    }
 }
 pub fn claude_dir() -> PathBuf {
     home().join(".claude")
@@ -155,11 +191,68 @@ pub fn valid_tool_result_name(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
-pub fn is_within(path: &Path, root: &Path) -> bool {
-    match (fs::canonicalize(path), fs::canonicalize(root)) {
-        (Ok(p), Ok(r)) => p != r && p.starts_with(r),
-        _ => false,
+fn realpath(path: &Path) -> PathBuf {
+    enum Part {
+        Name(std::ffi::OsString),
+        Resolved(PathBuf),
     }
+    fn parts(path: &Path) -> Vec<Part> {
+        path.as_os_str()
+            .as_bytes()
+            .split(|&b| b == b'/')
+            .rev()
+            .map(|s| Part::Name(std::ffi::OsString::from_vec(s.to_vec())))
+            .collect()
+    }
+    let mut pending = parts(path);
+    let mut resolved = if path.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+    };
+    let mut seen = std::collections::HashMap::<PathBuf, Option<PathBuf>>::new();
+    while let Some(part) = pending.pop() {
+        let name = match part {
+            Part::Resolved(link) => {
+                seen.insert(link, Some(resolved.clone()));
+                continue;
+            }
+            Part::Name(name) => name,
+        };
+        if name.is_empty() || name == "." {
+            continue;
+        }
+        if name == ".." {
+            resolved.pop();
+            continue;
+        }
+        let next = resolved.join(name);
+        if fs::symlink_metadata(&next).is_ok_and(|st| st.file_type().is_symlink()) {
+            if let Some(target) = seen.get(&next) {
+                resolved = target.clone().unwrap_or(next);
+                continue;
+            }
+            if let Ok(target) = fs::read_link(&next) {
+                if target.is_absolute() {
+                    resolved = PathBuf::from("/");
+                }
+                seen.insert(next.clone(), None);
+                pending.push(Part::Resolved(next));
+                pending.extend(parts(&target));
+                continue;
+            }
+        }
+        resolved = next;
+    }
+    resolved
+}
+pub fn is_within(path: &Path, root: &Path) -> bool {
+    let root = realpath(root);
+    let path = realpath(path);
+    // Python uses the literal root + separator prefix (including root == "/").
+    let mut prefix = root.as_os_str().as_bytes().to_vec();
+    prefix.push(b'/');
+    path.as_os_str().as_bytes().starts_with(&prefix)
 }
 pub fn open_regular(path: &Path, root: Option<&Path>) -> Result<File> {
     if root.is_some_and(|r| !is_within(path, r)) {
@@ -293,14 +386,17 @@ pub fn log(level: &str, msg: &str) {
         .append(true)
         .open(log_path())
     {
-        let _ = writeln!(
-            f,
-            "{} {} {}",
-            iso(now_epoch()),
-            level,
-            msg.replace('\n', " ")
-        );
+        let _ = write_log_line(&mut f, &iso(now_epoch()), level, msg);
     }
+}
+fn write_log_line(
+    writer: &mut impl Write,
+    timestamp: &str,
+    level: &str,
+    msg: &str,
+) -> io::Result<()> {
+    let line = format!("{timestamp} {level} {}\n", msg.replace('\n', " "));
+    writer.write_all(line.as_bytes())
 }
 pub fn parse_duration(s: &str) -> Result<u64> {
     let split = s.len().saturating_sub(1);
@@ -439,40 +535,65 @@ fn parse_date(s: &str) -> Option<i64> {
         Some(civil_days(y, m, d))
     }
 }
-fn parse_time(s: &str) -> Option<[i64; 4]> {
+// CPython's C parser returns a positive trailing-data status at a timezone.
+// The clock parser accepts that status; the offset parser requires end-of-input.
+fn parse_time(s: &str, end: usize) -> Option<([i64; 4], bool)> {
+    let bytes = s.as_bytes();
     let mut out = [0; 4];
     let mut pos = 0;
-    let separated = s.as_bytes().get(2) == Some(&b':');
+    let mut separated = true;
     for (i, part) in out.iter_mut().enumerate().take(3) {
         *part = decimal(s.get(pos..pos + 2)?)?;
         pos += 2;
-        if pos == s.len() || matches!(s.as_bytes().get(pos), Some(b'.' | b',')) {
+        let c = bytes.get(pos).copied().unwrap_or(0);
+        pos += 1;
+        if i == 0 {
+            separated = c == b':';
+        }
+        if pos >= end {
+            return Some((out, c != 0));
+        }
+        if separated && c == b':' {
+            continue;
+        }
+        if matches!(c, b'.' | b',') {
             break;
         }
-        if i < 2 && separated {
-            if s.as_bytes().get(pos) != Some(&b':') {
-                return None;
-            }
-            pos += 1;
-        }
-    }
-    if pos < s.len() {
-        if !matches!(s.as_bytes().get(pos), Some(b'.' | b',')) {
+        if !separated {
+            pos -= 1;
+        } else {
             return None;
         }
+    }
+    let digits = end.checked_sub(pos)?.min(6);
+    out[3] = decimal(s.get(pos..pos + digits)?)? * 10_i64.pow((6 - digits) as u32);
+    pos += digits;
+    while bytes.get(pos).is_some_and(u8::is_ascii_digit) {
         pos += 1;
-        let fraction = s.get(pos..)?;
-        if fraction.is_empty() || !fraction.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        let digits = fraction.len().min(6);
-        out[3] = decimal(&fraction[..digits])? * 10_i64.pow((6 - digits) as u32);
     }
-    Some(out)
+    Some((out, pos != bytes.len()))
 }
 pub fn parse_ts(value: &Value) -> Option<f64> {
-    let s = text(value)?;
-    let s = ccs_pytext::strip(&s);
+    let Value::String(points) = value else {
+        return None;
+    };
+    let mut points = ccs_pytext::strip_points(points).to_vec();
+    if points.last() == Some(&u32::from('Z')) {
+        points.pop();
+        points.extend("+00:00".chars().map(u32::from));
+    }
+    // fromisoformat sanitizes a single surrogate at a possible separator.
+    if let Some(pos) = [7, 8, 10]
+        .into_iter()
+        .find(|&i| points.get(i).is_some_and(|p| (0xd800..=0xdfff).contains(p)))
+    {
+        points[pos] = u32::from('T');
+    }
+    let s: String = points
+        .into_iter()
+        .map(char::from_u32)
+        .collect::<Option<_>>()?;
+    let s = s.as_str();
     let sep = date_separator(s)?;
     let days = parse_date(s.get(..sep)?)?;
     if s.len() == sep {
@@ -481,15 +602,22 @@ pub fn parse_ts(value: &Value) -> Option<f64> {
     let separator = s.get(sep..)?.chars().next()?;
     let time = s.get(sep + separator.len_utf8()..)?;
     let zone = time.find(['-', '+', 'Z']);
-    let (clock, tz) = zone.map_or((time, None), |i| (&time[..i], Some(&time[i..])));
-    let [h, m, sec, micro] = parse_time(clock)?;
+    let tz = zone.map(|i| &time[i..]);
+    let ([h, m, sec, micro], trailing) = parse_time(time, zone.unwrap_or(time.len()))?;
+    if trailing && zone.is_none() {
+        return None;
+    }
     if h > 23 || m > 59 || sec > 59 {
         return None;
     }
     let mut offset = 0_i64;
     if let Some(tz) = tz {
         if tz != "Z" {
-            let [h, m, s, us] = parse_time(tz.get(1..)?)?;
+            let tail = tz.get(1..)?;
+            let ([h, m, s, us], trailing) = parse_time(tail, tail.len())?;
+            if trailing {
+                return None;
+            }
             // CPython treats an offset of zero hours/minutes/seconds as UTC.
             if h != 0 || m != 0 || s != 0 {
                 offset = (h * 3600 + m * 60 + s) * 1_000_000 + us;
@@ -552,6 +680,28 @@ pub fn short_cwd(cwd: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn log_line_is_one_write() {
+        #[derive(Default)]
+        struct Counter {
+            writes: usize,
+            bytes: Vec<u8>,
+        }
+        impl Write for Counter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                self.bytes.extend(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = Counter::default();
+        write_log_line(&mut writer, "2026-01-01T00:00:00Z", "WARN", "first\nsecond").unwrap();
+        assert_eq!(writer.writes, 1);
+        assert_eq!(writer.bytes, b"2026-01-01T00:00:00Z WARN first second\n");
+    }
     #[test]
     fn identifiers_reject_trailing_newlines_and_separators() {
         assert!(valid_session_id("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"));

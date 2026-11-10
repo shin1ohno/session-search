@@ -64,8 +64,133 @@ fn increment(s: &str) -> String {
     bytes.insert(0, b'1');
     String::from_utf8(bytes).unwrap()
 }
-fn at_least(a: &str, b: &str) -> bool {
-    a.len() > b.len() || (a.len() == b.len() && a >= b)
+fn integer(s: &str) -> bool {
+    !s.is_empty()
+        && s.strip_prefix('-')
+            .unwrap_or(s)
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+}
+fn integer_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let parts = |s: &str| {
+        let digits = s.trim_start_matches('-').trim_start_matches('0').to_owned();
+        (s.starts_with('-') && !digits.is_empty(), digits)
+    };
+    let (negative_a, a) = parts(a);
+    let (negative_b, b) = parts(b);
+    match (negative_a, negative_b) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => {
+            let order = a.len().cmp(&b.len()).then_with(|| a.cmp(&b));
+            if negative_a {
+                order.reverse()
+            } else {
+                order
+            }
+        }
+    }
+}
+fn numeric(v: &Value) -> Option<&str> {
+    match v {
+        Value::Number(s) => Some(s),
+        Value::Bool(true) => Some("1"),
+        Value::Bool(false) => Some("0"),
+        _ => None,
+    }
+}
+fn numeric_cmp(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    if integer(a) && integer(b) {
+        return Some(integer_cmp(a, b));
+    }
+    if !integer(a) && integer(b) {
+        return numeric_cmp(b, a).map(std::cmp::Ordering::reverse);
+    }
+    let x = a.parse::<f64>().ok()?;
+    let y = b.parse::<f64>().ok()?;
+    if integer(a) {
+        if y.is_nan() {
+            return None;
+        }
+        if y.is_infinite() {
+            return Some(if y.is_sign_positive() {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            });
+        }
+        // Comparing through f64 alone would equate adjacent integers above 2**53.
+        let order = integer_cmp(a, &format!("{:.0}", y.trunc()));
+        return Some(order.then_with(|| 0.0_f64.partial_cmp(&y.fract()).unwrap()));
+    }
+    x.partial_cmp(&y)
+}
+fn python_equal(a: &Value, b: &Value) -> bool {
+    if let (Some(a), Some(b)) = (numeric(a), numeric(b)) {
+        return numeric_cmp(a, b) == Some(std::cmp::Ordering::Equal);
+    }
+    match (a, b) {
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| python_equal(a, b))
+        }
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter().all(|(k, v)| {
+                    b.iter()
+                        .find(|(other, _)| k == other)
+                        .is_some_and(|(_, other)| python_equal(v, other))
+                })
+        }
+        _ => a == b,
+    }
+}
+fn next_ordinal(value: &Value) -> Value {
+    let Some(s) = numeric(value) else {
+        return Value::Null;
+    };
+    if !integer(s) {
+        return number(format!("{:?}", s.parse::<f64>().unwrap_or(f64::NAN) + 1.0));
+    }
+    if let Some(negative) = s.strip_prefix('-').filter(|s| s.bytes().any(|b| b != b'0')) {
+        let mut digits = negative.as_bytes().to_vec();
+        for b in digits.iter_mut().rev() {
+            if *b != b'0' {
+                *b -= 1;
+                break;
+            }
+            *b = b'9';
+        }
+        let digits = String::from_utf8(digits).unwrap();
+        let digits = digits.trim_start_matches('0');
+        if digits.is_empty() {
+            number(0)
+        } else {
+            number(format!("-{digits}"))
+        }
+    } else {
+        number(increment(s.trim_start_matches('-')))
+    }
+}
+fn saved_dict(saved: Option<&Value>) -> Value {
+    match saved {
+        Some(Value::Object(items)) => Value::Object(items.clone()),
+        Some(Value::Array(pairs)) => {
+            let mut items: Vec<(Vec<u32>, Value)> = vec![];
+            for pair in pairs {
+                if let Value::Array(pair) = pair {
+                    if let [Value::String(key), value] = pair.as_slice() {
+                        if let Some((_, prior)) = items.iter_mut().find(|(k, _)| k == key) {
+                            *prior = value.clone();
+                        } else {
+                            items.push((key.clone(), value.clone()));
+                        }
+                    }
+                }
+            }
+            Value::Object(items)
+        }
+        _ => Value::Object(vec![]),
+    }
 }
 #[derive(Clone, Debug)]
 pub struct IndexState {
@@ -76,22 +201,25 @@ impl IndexState {
     pub fn new(session_id: Value, saved: Option<&Value>) -> Self {
         Self {
             session_id,
-            state: saved
-                .filter(|v| matches!(v, Value::Object(_)))
-                .cloned()
-                .unwrap_or(Value::Object(vec![])),
+            state: saved_dict(saved),
         }
     }
     pub fn accept(&mut self, rec: &Value) -> bool {
         let ordinal = nonnegative_integer(get(rec, "ordinal"))
-            .or_else(|| nonnegative_integer(get(&self.state, "next_ordinal")))
-            .unwrap_or_else(|| "0".into());
-        set(&mut self.state, "next_ordinal", number(increment(&ordinal)));
+            .map(number)
+            .unwrap_or_else(|| {
+                if has(&self.state, "next_ordinal") {
+                    get(&self.state, "next_ordinal").clone()
+                } else {
+                    number(0)
+                }
+            });
+        set(&mut self.state, "next_ordinal", next_ordinal(&ordinal));
         let kind = get(rec, "type");
         let payload = get(rec, "payload");
         if is(kind, "session_meta") {
             if !matches!(payload, Value::Object(_))
-                || get(payload, "id") != &self.session_id
+                || !python_equal(get(payload, "id"), &self.session_id)
                 || truthy(get(&self.state, "header_seen"))
             {
                 return false;
@@ -118,13 +246,17 @@ impl IndexState {
         if is(kind, "session-search-tombstone") {
             return true;
         }
-        if let Some(start) = nonnegative_integer(get(&self.state, "start_ordinal")) {
-            return at_least(&ordinal, &start);
+        let start = get(&self.state, "start_ordinal");
+        if !matches!(start, Value::Null) {
+            return numeric(&ordinal)
+                .zip(numeric(start))
+                .and_then(|(a, b)| numeric_cmp(a, b))
+                .is_some_and(|order| order != std::cmp::Ordering::Less);
         }
         if truthy(get(&self.state, "forked")) && !truthy(get(&self.state, "own_started")) {
             if is(kind, "event_msg")
                 && is(get(payload, "type"), "thread_settings_applied")
-                && get(payload, "thread_id") == &self.session_id
+                && python_equal(get(payload, "thread_id"), &self.session_id)
             {
                 set(&mut self.state, "own_started", Value::Bool(true));
             } else {
@@ -223,7 +355,10 @@ pub fn normalize_with_context(
         let args = if matches!(args, Value::String(_)) {
             args.clone()
         } else {
-            string(json_string(args, false, false)?)
+            Value::String(
+                ccs_pytext::json_dumps_points(args, false, false)
+                    .map_err(|_| crate::util::invalid("cannot serialize tool arguments"))?,
+            )
         };
         let name = get(payload, "name");
         object([
@@ -237,7 +372,10 @@ pub fn normalize_with_context(
         let output = if matches!(output, Value::String(_)) {
             output.clone()
         } else {
-            string(json_string(output, false, false)?)
+            Value::String(
+                ccs_pytext::json_dumps_points(output, false, false)
+                    .map_err(|_| crate::util::invalid("cannot serialize tool output"))?,
+            )
         };
         object([("type", string("tool_result")), ("content", output)])
     } else {

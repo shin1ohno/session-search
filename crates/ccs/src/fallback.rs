@@ -5,7 +5,7 @@ use ccs_pytext::json::Value;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::{ffi::OsStrExt, process::ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -46,15 +46,14 @@ pub fn main_files(root: &Path) -> Vec<PathBuf> {
         };
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.to_str().is_none() {
-                util::log("WARN", "skipping non-UTF-8 transcript path");
-                continue;
-            }
             if entry.file_type().is_ok_and(|t| t.is_file())
                 && p.file_name()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|s| s.ends_with(".jsonl"))
+                    .is_some_and(|s| s.as_bytes().ends_with(b".jsonl"))
             {
+                if p.to_str().is_none() {
+                    util::log("WARN", "skipping non-UTF-8 transcript path");
+                    continue;
+                }
                 out.push(p);
             }
         }
@@ -62,7 +61,9 @@ pub fn main_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 pub fn newest(mut paths: Vec<PathBuf>, cap: Option<usize>) -> Vec<PathBuf> {
-    paths.sort_by_cached_key(|p| std::cmp::Reverse((extract::mtime(p) * 1_000_000_000.0) as i128));
+    let mut keyed: Vec<_> = paths.drain(..).map(|p| (extract::mtime(&p), p)).collect();
+    keyed.sort_by(|a, b| b.0.total_cmp(&a.0));
+    paths.extend(keyed.into_iter().map(|(_, p)| p));
     if let Some(cap) = cap {
         paths.truncate(cap);
     }

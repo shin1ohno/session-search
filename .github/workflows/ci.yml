@@ -30,6 +30,18 @@ jobs:
       - run: cargo test --locked --workspace
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo build --locked --release --workspace --examples && cargo build --locked --release --bin ccs
+      - name: Install local search dependency
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
+      - name: Local reading and Python text differential gates
+        run: |
+          python3 crates/ccs-pytext/tests/text_oracle.py target/release/examples/text_probe
+          python3 crates/ccs/tests/local_oracle.py
+          python3 crates/ccs/tests/codepoint_oracle.py
+          python3 crates/ccs/tests/review_oracle.py
+      - name: Regenerate pinned Unicode tables
+        run: |
+          python3 crates/ccs-pytext/tools/gen_text_tables.py "$RUNNER_TEMP/tables.rs"
+          diff -u crates/ccs-pytext/src/tables.rs "$RUNNER_TEMP/tables.rs"
       - name: Foundation, cross-check and locking gates
         run: |
           python3 tools/test_foundation.py

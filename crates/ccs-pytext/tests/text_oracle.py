@@ -44,6 +44,13 @@ for b in [bytes([i]) for i in range(256)] + [bytes(rng.randrange(256) for _ in r
 for authority in ('localhost', 'USER:pass@EXAMPLE.com:80', '[::1]:42', '[127.0.0.1]', '[v1.future]', '[v.bad]', '[::1%Zone]', 'bad[::1]suffix', 'a＠b', 'a／b', 'ß.Example', '[bad', 'bad]'):
     for prefix in ('https://', '//', '\x00\x20HTTP://', '\tHtTp://'):
         case('urlsplit', prefix + authority + '/path?q=x#f')
+for authority in ('ΑΣ', 'ΑΣΑ', 'ΑΣ\u0301', 'AΣ\u0345A', 'AΣ\u0345.', '[::1%]', '[::1%a%b]', '[::1%Zone]'):
+    case('urlsplit', 'https://' + authority + '/')
+# Sample every Unicode block in Final_Sigma context, including cased/ignorable overlap.
+for cp in range(0, 0x110000, 37):
+    if 0xD800 <= cp <= 0xDFFF or chr(cp) in '/?#@[]:': continue
+    for tail in ['A', '.']:
+        case('urlsplit', 'https://AΣ' + chr(cp) + tail + '/')
 result = subprocess.run([str(binary.resolve())], input='\n'.join(c[0] for c in cases) + '\n', text=True, capture_output=True, check=True)
 rows = result.stdout.splitlines()
 if len(rows) != len(cases): raise SystemExit(f'FAIL output rows {len(rows)} != {len(cases)}')

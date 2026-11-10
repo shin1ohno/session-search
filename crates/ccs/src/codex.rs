@@ -1,6 +1,6 @@
 //! Native Codex rollout discovery; no database writes or model calls.
 use crate::errors::Result;
-use crate::util::{self, get, is, object, string, text};
+use crate::util::{self, get, is, object, string};
 use ccs_pytext::json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -71,17 +71,21 @@ fn visit(root: &Path, out: &mut Vec<PathBuf>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.to_str().is_none() {
-            util::log("WARN", "skipping non-UTF-8 transcript path");
-            continue;
-        }
         let Ok(kind) = entry.file_type() else {
             continue;
         };
         if kind.is_dir() {
             visit(&path, out);
-        } else if !kind.is_symlink() && rollout_id(&path).is_some() {
-            out.push(path);
+        } else if !kind.is_symlink()
+            && path
+                .file_name()
+                .is_some_and(|name| rollout_id(Path::new(name)).is_some())
+        {
+            if path.to_str().is_none() {
+                util::log("WARN", "skipping non-UTF-8 transcript path");
+            } else {
+                out.push(path);
+            }
         }
     }
 }
@@ -108,7 +112,13 @@ fn metadata_under(path: &Path, root: &Path) -> Value {
     let Some(raw) = decode_metadata(&raw) else {
         return Value::Object(vec![]);
     };
-    let Ok(rec) = ccs_pytext::json::loads(&raw) else {
+    let Ok(parsed) = ccs_pytext::json::parse_bounded(&raw, usize::MAX) else {
+        return Value::Object(vec![]);
+    };
+    if parsed.flags.big_int {
+        return Value::Object(vec![]);
+    }
+    let Some(rec) = parsed.value else {
         return Value::Object(vec![]);
     };
     if is(get(&rec, "type"), "session_meta") && matches!(get(&rec, "payload"), Value::Object(_)) {
@@ -217,8 +227,10 @@ fn classify_under(path: &Path, root: &Path) -> Option<Value> {
     }
     let sid = rollout_id(&p)?;
     let meta = metadata_under(&p, &root);
-    let cwd = text(get(&meta, "cwd"))?;
-    if !is(get(&meta, "id"), &sid) || !cwd.starts_with('/') {
+    let Value::String(cwd) = get(&meta, "cwd") else {
+        return None;
+    };
+    if !is(get(&meta, "id"), &sid) || cwd.first() != Some(&u32::from('/')) {
         return None;
     }
     Some(object([
@@ -227,7 +239,14 @@ fn classify_under(path: &Path, root: &Path) -> Option<Value> {
         ("session_id", string(sid)),
         (
             "project_dir",
-            string(format!("codex-{}", util::encode_cwd(&cwd))),
+            string(format!(
+                "codex-{}",
+                cwd.iter()
+                    .map(|&cp| char::from_u32(cp)
+                        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+                        .unwrap_or('-'))
+                    .collect::<String>()
+            )),
         ),
     ]))
 }

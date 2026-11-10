@@ -59,6 +59,30 @@ fn map_case(s: &str, table: &[(u32, &str)]) -> String {
     }
     out
 }
+fn lower(s: &str) -> String {
+    let chars: Vec<_> = s.chars().collect();
+    let mut out = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if c == 'Σ' {
+            let before = chars[..i]
+                .iter()
+                .rev()
+                .find(|&&c| !in_ranges(c, tables::CASE_IGNORABLE));
+            let after = chars[i + 1..]
+                .iter()
+                .find(|&&c| !in_ranges(c, tables::CASE_IGNORABLE));
+            let final_sigma = before.is_some_and(|&c| in_ranges(c, tables::CASED))
+                && !after.is_some_and(|&c| in_ranges(c, tables::CASED));
+            out.push(if final_sigma { 'ς' } else { 'σ' });
+        } else {
+            match tables::LOWER.binary_search_by_key(&(c as u32), |&(cp, _)| cp) {
+                Ok(i) => out.push_str(tables::LOWER[i].1),
+                Err(_) => out.push(c),
+            }
+        }
+    }
+    out
+}
 pub fn casefold(s: &str) -> String {
     map_case(s, tables::CASEFOLD)
 }
@@ -99,6 +123,92 @@ pub fn casefold_points(s: &[u32]) -> Vec<u32> {
 }
 pub fn decode_replace(s: &[u8]) -> String {
     String::from_utf8_lossy(s).into_owned()
+}
+
+/// Python json.dumps returns a string, before any UTF-8 encoding boundary.
+pub fn json_dumps_points(
+    value: &json::Value,
+    ascii: bool,
+    sorted: bool,
+) -> Result<Vec<u32>, json::Error> {
+    enum Part<'a> {
+        Value(&'a json::Value),
+        Key(&'a [u32]),
+        Literal(&'static str),
+    }
+    fn quoted(s: &[u32], ascii: bool, out: &mut Vec<u32>) -> Result<(), json::Error> {
+        if ascii {
+            out.extend(
+                json::dumps(&json::Value::String(s.to_vec()), true, false)?
+                    .chars()
+                    .map(u32::from),
+            );
+            return Ok(());
+        }
+        out.push(34);
+        for &cp in s {
+            let escape = match cp {
+                34 => Some("\\\""),
+                92 => Some("\\\\"),
+                8 => Some("\\b"),
+                12 => Some("\\f"),
+                10 => Some("\\n"),
+                13 => Some("\\r"),
+                9 => Some("\\t"),
+                _ => None,
+            };
+            if let Some(s) = escape {
+                out.extend(s.chars().map(u32::from));
+            } else if cp < 32 {
+                out.extend(format!("\\u{cp:04x}").chars().map(u32::from));
+            } else if cp <= 0x10ffff {
+                out.push(cp);
+            } else {
+                return Err(json::Error::CodePoint);
+            }
+        }
+        out.push(34);
+        Ok(())
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![Part::Value(value)];
+    while let Some(part) = stack.pop() {
+        match part {
+            Part::Literal(s) => out.extend(s.chars().map(u32::from)),
+            Part::Key(s) => quoted(s, ascii, &mut out)?,
+            Part::Value(json::Value::String(s)) => quoted(s, ascii, &mut out)?,
+            Part::Value(json::Value::Array(values)) => {
+                out.push(91);
+                stack.push(Part::Literal("]"));
+                for (i, value) in values.iter().enumerate().rev() {
+                    stack.push(Part::Value(value));
+                    if i > 0 {
+                        stack.push(Part::Literal(", "));
+                    }
+                }
+            }
+            Part::Value(json::Value::Object(values)) => {
+                let mut values: Vec<_> = values.iter().collect();
+                if sorted {
+                    values.sort_by(|a, b| a.0.cmp(&b.0));
+                }
+                out.push(123);
+                stack.push(Part::Literal("}"));
+                for (i, (key, value)) in values.into_iter().enumerate().rev() {
+                    stack.push(Part::Value(value));
+                    stack.push(Part::Literal(": "));
+                    stack.push(Part::Key(key));
+                    if i > 0 {
+                        stack.push(Part::Literal(", "));
+                    }
+                }
+            }
+            Part::Value(value) => {
+                out.extend(json::dumps(value, ascii, sorted)?.chars().map(u32::from))
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub fn shell_quote(s: &str) -> String {
@@ -168,7 +278,7 @@ impl UrlParts {
         let (host, zone) = host
             .split_once('%')
             .map_or((host, None), |(h, z)| (h, Some(z)));
-        Some(map_case(host, tables::LOWER) + &zone.map(|s| format!("%{s}")).unwrap_or_default())
+        Some(lower(host) + &zone.map(|s| format!("%{s}")).unwrap_or_default())
     }
 }
 pub fn urlsplit(value: &str) -> Result<UrlParts, UrlError> {
@@ -221,11 +331,14 @@ pub fn urlsplit(value: &str) -> Result<UrlParts, UrlError> {
                     return Err(UrlError);
                 }
             } else if address
-                .split('%')
-                .next()
-                .unwrap_or("")
-                .parse::<std::net::Ipv6Addr>()
-                .is_err()
+                .split_once('%')
+                .is_some_and(|(_, zone)| zone.is_empty() || zone.contains('%'))
+                || address
+                    .split('%')
+                    .next()
+                    .unwrap_or("")
+                    .parse::<std::net::Ipv6Addr>()
+                    .is_err()
             {
                 return Err(UrlError);
             }
