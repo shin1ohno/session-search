@@ -201,12 +201,10 @@ pub fn search_options(
                     .skip(offset)
                     .step_by(4)
                     .map(|(i, p)| {
-                        (
-                            i,
-                            extract::scan(p, if short { None } else { Some(query) }, 4),
-                        )
+                        extract::scan_checked(p, if short { None } else { Some(query) }, 4)
+                            .map(|session| (i, session))
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Result<Vec<_>>>()
             }));
         }
         let mut out = vec![];
@@ -214,7 +212,7 @@ pub fn search_options(
             out.extend(
                 worker
                     .join()
-                    .map_err(|_| util::invalid("local scan worker failed"))?,
+                    .map_err(|_| util::invalid("local scan worker failed"))??,
             );
         }
         Ok(out)

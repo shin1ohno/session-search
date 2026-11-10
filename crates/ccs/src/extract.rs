@@ -130,6 +130,7 @@ pub struct Records {
     position: usize,
     entrypoint: Value,
     cwd: Value,
+    failure: Option<crate::errors::Error>,
 }
 pub fn iter_records(path: &Path) -> Records {
     let native = codex::is_path(path);
@@ -153,6 +154,7 @@ pub fn iter_records(path: &Path) -> Records {
         position: 0,
         entrypoint: Value::Null,
         cwd: Value::Null,
+        failure: None,
     }
 }
 impl Iterator for Records {
@@ -177,13 +179,18 @@ impl Iterator for Records {
                 if !index.accept(&rec) {
                     continue;
                 }
-                let Ok(normal) = session_codex::normalize_with_context(
+                let normal = match session_codex::normalize_with_context(
                     &rec,
                     position,
                     &self.entrypoint,
                     &self.cwd,
-                ) else {
-                    continue;
+                ) {
+                    Ok(normal) => normal,
+                    Err(error) => {
+                        self.failure = Some(error);
+                        self.reader = None;
+                        return None;
+                    }
                 };
                 rec = normal;
                 self.entrypoint = get(&rec, "entrypoint").clone();
@@ -313,6 +320,22 @@ pub fn mtime(path: &Path) -> f64 {
 pub fn scan(path: &Path, query: Option<&str>, keep_last: usize) -> LocalSession {
     scan_records(path, query, keep_last, iter_records(path))
 }
+/// Production result boundary: normalization errors must not become no matches.
+pub fn scan_checked(path: &Path, query: Option<&str>, keep_last: usize) -> Result<LocalSession> {
+    scan_reader(path, query, keep_last, iter_records(path))
+}
+fn scan_reader(
+    path: &Path,
+    query: Option<&str>,
+    keep_last: usize,
+    mut records: Records,
+) -> Result<LocalSession> {
+    let session = scan_records(path, query, keep_last, &mut records);
+    match records.failure {
+        Some(error) => Err(error),
+        None => Ok(session),
+    }
+}
 fn scan_records(
     path: &Path,
     query: Option<&str>,
@@ -432,12 +455,32 @@ fn scan_records(
     s
 }
 pub fn extract(path: &Path) -> Result<Value> {
-    Ok(scan(path, None, 4).value())
+    Ok(scan_checked(path, None, 4)?.value())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn normalization_failure_reaches_result_boundary() {
+        let path = std::env::temp_dir().join(format!(
+            "ccs-normalize-error-{}-{}",
+            std::process::id(),
+            util::now_epoch().to_bits()
+        ));
+        fs::write(&path, concat!(r#"{"type":"response_item","payload":{"type":"message","role":"user","content":"needle\ud800"}}"#, "\n")).unwrap();
+        let records = Records {
+            reader: Some(BufReader::new(fs::File::open(&path).unwrap())),
+            index: Some(session_codex::IndexState::new(Value::Null, None)),
+            position: 0,
+            entrypoint: Value::Null,
+            cwd: Value::Null,
+            failure: None,
+        };
+        let error = scan_reader(&path, Some("needle"), 4, records).unwrap_err();
+        assert_eq!(error.exit_status().code(), 1);
+        fs::remove_file(path).unwrap();
+    }
     #[test]
     fn extractor_strips_leading_blocks_and_meta() {
         assert_eq!(strip_leading_blocks("\x1c<system-reminder>ignore\n</system-reminder><bash-stdout>x</bash-stdout> real text "),"real text");
