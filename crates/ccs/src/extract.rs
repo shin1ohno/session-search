@@ -39,32 +39,69 @@ pub fn strip_leading_blocks(mut value: &str) -> String {
         }
     }
 }
+/// UTF-8 display view. Use record_text_points for exact Python/JSON strings.
 pub fn record_text(rec: &Value) -> String {
+    display_points(&record_text_points(rec))
+}
+fn points(value: &Value) -> Option<&[u32]> {
+    match value {
+        Value::String(value) => Some(value),
+        _ => None,
+    }
+}
+fn display_points(value: &[u32]) -> String {
+    value
+        .iter()
+        .map(|&c| char::from_u32(c).unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect()
+}
+pub fn strip_leading_points(mut value: &[u32]) -> Vec<u32> {
+    loop {
+        let start = ccs_pytext::lstrip_points(value);
+        let mut removed = false;
+        for tag in LEADING_TAGS {
+            let open: Vec<_> = format!("<{tag}>").chars().map(u32::from).collect();
+            let close: Vec<_> = format!("</{tag}>").chars().map(u32::from).collect();
+            if let Some(body) = start.strip_prefix(open.as_slice()) {
+                if let Some(end) = body.windows(close.len()).position(|s| s == close) {
+                    value = ccs_pytext::lstrip_points(&body[end + close.len()..]);
+                    removed = true;
+                    break;
+                }
+            }
+        }
+        if !removed {
+            return ccs_pytext::strip_points(value).to_vec();
+        }
+    }
+}
+/// Exact Python text, including lone surrogates that a Rust String cannot hold.
+pub fn record_text_points(rec: &Value) -> Vec<u32> {
     if !["user", "assistant"]
         .iter()
         .any(|s| is(get(rec, "type"), s))
         || get(rec, "isMeta") == &Value::Bool(true)
         || get(rec, "isCompactSummary") == &Value::Bool(true)
     {
-        return String::new();
+        return Vec::new();
     }
     let content = get(get(rec, "message"), "content");
     let parts = match content {
-        Value::String(_) => text(content).into_iter().collect::<Vec<_>>(),
+        Value::String(_) => points(content).into_iter().collect::<Vec<_>>(),
         Value::Array(blocks) => blocks
             .iter()
             .filter(|b| is(get(b, "type"), "text"))
-            .filter_map(|b| text(get(b, "text")))
+            .filter_map(|b| points(get(b, "text")))
             .collect(),
         _ => vec![],
     };
-    strip_leading_blocks(
+    strip_leading_points(
         &parts
             .iter()
-            .map(|s| strip_leading_blocks(s))
+            .map(|s| strip_leading_points(s))
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
-            .join("\n"),
+            .join(&[u32::from('\n')][..]),
     )
 }
 pub fn loads_strict(s: &str) -> Result<Value> {
@@ -171,6 +208,17 @@ pub struct LocalSession {
     pub hits: usize,
     pub last_texts: VecDeque<(String, String)>,
     pub mtime: f64,
+    // UTF-8 fields above are display projections. JSON consumers use value(),
+    // which retains Python's full code-point strings rather than these views.
+    source: LocalText,
+}
+#[derive(Clone, Debug, Default)]
+struct LocalText {
+    title: Vec<u32>,
+    cwd: Vec<u32>,
+    cwd_candidates: Vec<Vec<u32>>,
+    entrypoint: Option<Vec<u32>>,
+    last_texts: VecDeque<(String, Vec<u32>)>,
 }
 impl LocalSession {
     pub fn interactive(&self) -> bool {
@@ -185,35 +233,71 @@ impl LocalSession {
             .map(String::as_str)
             .unwrap_or(&self.cwd)
     }
+    pub fn cwd_points(&self) -> &[u32] {
+        &self.source.cwd
+    }
+    pub fn resume_cwd_points(&self) -> &[u32] {
+        self.source
+            .cwd_candidates
+            .iter()
+            .find(|cwd| {
+                let encoded: String = cwd
+                    .iter()
+                    .map(|&c| {
+                        char::from_u32(c)
+                            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+                            .unwrap_or('-')
+                    })
+                    .collect();
+                encoded == self.project_dir
+            })
+            .map(Vec::as_slice)
+            .unwrap_or(&self.source.cwd)
+    }
     pub fn value(&self) -> Value {
         object([
             ("path", string(self.path.to_string_lossy())),
             ("session_id", string(&self.session_id)),
             ("project_dir", string(&self.project_dir)),
             ("agent", string(&self.agent)),
-            ("title", string(&self.title)),
-            ("cwd", string(&self.cwd)),
+            ("title", Value::String(self.source.title.clone())),
+            ("cwd", Value::String(self.source.cwd.clone())),
             (
                 "cwd_candidates",
-                Value::Array(self.cwd_candidates.iter().map(string).collect()),
+                Value::Array(
+                    self.source
+                        .cwd_candidates
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect(),
+                ),
             ),
             (
                 "entrypoint",
-                self.entrypoint.as_ref().map(string).unwrap_or(Value::Null),
+                self.source
+                    .entrypoint
+                    .clone()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
             ),
             ("hits", number(self.hits)),
             (
                 "last_texts",
                 Value::Array(
-                    self.last_texts
+                    self.source
+                        .last_texts
                         .iter()
-                        .map(|(r, t)| Value::Array(vec![string(r), string(t)]))
+                        .map(|(r, t)| Value::Array(vec![string(r), Value::String(t.clone())]))
                         .collect(),
                 ),
             ),
-            ("mtime", number(self.mtime)),
+            ("mtime", number(format!("{:?}", self.mtime))),
             ("interactive", Value::Bool(self.interactive())),
-            ("resume_cwd", string(self.resume_cwd())),
+            (
+                "resume_cwd",
+                Value::String(self.resume_cwd_points().to_vec()),
+            ),
         ])
     }
 }
@@ -261,23 +345,27 @@ fn scan_records(
         hits: 0,
         last_texts: VecDeque::new(),
         mtime: mtime(path),
+        source: LocalText::default(),
     };
-    let query = ccs_pytext::casefold(query.unwrap_or(""));
+    let query: Vec<u32> = ccs_pytext::casefold(query.unwrap_or(""))
+        .chars()
+        .map(u32::from)
+        .collect();
     let mut titles = [None, None, None];
     let mut first = None;
     for rec in records {
-        if s.cwd.is_empty() {
-            if let Some(cwd) = text(get(&rec, "cwd")) {
-                s.cwd = cwd.clone();
-                s.cwd_candidates.push(cwd);
+        if s.source.cwd.is_empty() {
+            if let Some(cwd) = points(get(&rec, "cwd")) {
+                s.source.cwd = cwd.to_vec();
+                s.source.cwd_candidates.push(cwd.to_vec());
             }
         }
-        if s.entrypoint.is_none() {
-            s.entrypoint = text(get(&rec, "entrypoint"));
+        if s.source.entrypoint.is_none() {
+            s.source.entrypoint = points(get(&rec, "entrypoint")).map(<[u32]>::to_vec);
         }
-        if let Some(cwd) = text(get(&rec, "relocatedCwd")) {
-            if !s.cwd_candidates.contains(&cwd) {
-                s.cwd_candidates.push(cwd);
+        if let Some(cwd) = points(get(&rec, "relocatedCwd")) {
+            if !s.source.cwd_candidates.iter().any(|c| c == cwd) {
+                s.source.cwd_candidates.push(cwd.to_vec());
             }
         }
         for (i, (kind, key)) in [
@@ -289,25 +377,30 @@ fn scan_records(
         .enumerate()
         {
             if is(get(&rec, "type"), kind) {
-                if let Some(t) = text(get(&rec, key)) {
-                    titles[i] = Some(t);
+                if let Some(t) = points(get(&rec, key)) {
+                    titles[i] = Some(t.to_vec());
                 }
             }
         }
-        let content = record_text(&rec);
+        let content = record_text_points(&rec);
         if content.is_empty() {
             continue;
         }
         if first.is_none() && is(get(&rec, "type"), "user") {
             first = Some(content.clone());
         }
-        if !query.is_empty() && ccs_pytext::casefold(&content).contains(&query) {
+        if !query.is_empty()
+            && ccs_pytext::casefold_points(&content)
+                .windows(query.len())
+                .any(|s| s == query)
+        {
             s.hits += 1;
         }
-        s.last_texts
+        s.source
+            .last_texts
             .push_back((text(get(&rec, "type")).unwrap_or_default(), content));
-        if s.last_texts.len() > keep_last {
-            s.last_texts.pop_front();
+        if s.source.last_texts.len() > keep_last {
+            s.source.last_texts.pop_front();
         }
     }
     let title = titles
@@ -316,10 +409,25 @@ fn scan_records(
         .find(|s| !s.is_empty())
         .or(first)
         .unwrap_or_default();
-    s.title = ccs_pytext::split(&title)
-        .join(" ")
-        .chars()
+    s.source.title = ccs_pytext::split_points(&title)
+        .join(&[u32::from(' ')][..])
+        .into_iter()
         .take(120)
+        .collect();
+    s.title = display_points(&s.source.title);
+    s.cwd = display_points(&s.source.cwd);
+    s.cwd_candidates = s
+        .source
+        .cwd_candidates
+        .iter()
+        .map(|s| display_points(s))
+        .collect();
+    s.entrypoint = s.source.entrypoint.as_ref().map(|s| display_points(s));
+    s.last_texts = s
+        .source
+        .last_texts
+        .iter()
+        .map(|(kind, text)| (kind.clone(), display_points(text)))
         .collect();
     s
 }
@@ -387,5 +495,48 @@ mod tests {
         assert!(loads_strict(r#"{"cwd":"/a","cwd":"/b"}"#).is_err());
         assert!(loads_strict(r#"{"message":{"a":1,"\u0061":2}}"#).is_err());
         assert!(loads_strict(r#"{"cwd":"/a","message":{"cwd":"/b"}}"#).is_ok());
+    }
+    #[test]
+    fn codepoint_records_remain_searchable() {
+        let rec = loads_strict(r#"{"type":"user","cwd":"/work/\udc80","relocatedCwd":"/resume/\ud800","entrypoint":"cli","message":{"content":"\u001c<system-reminder>\ud800</system-reminder> Stra\u00dfe\ud800needle "}}"#).unwrap();
+        let expected = loads_strict(r#""Stra\u00dfe\ud800needle""#).unwrap();
+        assert_eq!(Value::String(record_text_points(&rec)), expected);
+        let session = scan_records(
+            Path::new("/-resume--/session.jsonl"),
+            Some("STRASSE"),
+            4,
+            [rec.clone()],
+        );
+        let value = session.value();
+        assert_eq!(session.hits, 1);
+        assert!(session.interactive());
+        assert_eq!(get(&value, "title"), &expected);
+        assert_eq!(get(&value, "cwd"), get(&rec, "cwd"));
+        assert_eq!(get(&value, "mtime"), &Value::Number("0.0".into()));
+        assert_eq!(get(&value, "resume_cwd"), get(&rec, "relocatedCwd"));
+        assert_eq!(
+            get(&value, "last_texts"),
+            &Value::Array(vec![Value::Array(vec![string("user"), expected])])
+        );
+        assert_eq!(
+            scan_records(
+                Path::new("/session.jsonl"),
+                Some("\u{fffd}"),
+                4,
+                [rec.clone()]
+            )
+            .hits,
+            0
+        );
+        let title = loads_strict(
+            r#"{"type":"custom-title","customTitle":"\u001c custom\udfff\u2003title "}"#,
+        )
+        .unwrap();
+        let value = scan_records(Path::new("/session.jsonl"), None, 0, [rec, title]).value();
+        assert_eq!(
+            get(&value, "title"),
+            &loads_strict(r#""custom\udfff title""#).unwrap()
+        );
+        assert_eq!(get(&value, "last_texts"), &Value::Array(vec![]));
     }
 }

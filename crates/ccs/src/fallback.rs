@@ -230,11 +230,14 @@ pub fn search_options(
                     .is_some_and(|id| !id.is_empty() && s.session_id == id)
                 && (options.include_headless || s.interactive())
                 && !options.cwd_prefix.is_some_and(|prefix| {
+                    let exact: Vec<_> = prefix.chars().map(u32::from).collect();
+                    let directory: Vec<_> = format!("{}/", prefix.trim_end_matches('/'))
+                        .chars()
+                        .map(u32::from)
+                        .collect();
                     !prefix.is_empty()
-                        && s.cwd != prefix
-                        && !s
-                            .cwd
-                            .starts_with(&format!("{}/", prefix.trim_end_matches('/')))
+                        && s.cwd_points() != exact
+                        && !s.cwd_points().starts_with(&directory)
                 })
                 && !options.since_epoch.is_some_and(|epoch| s.mtime < epoch)
         })

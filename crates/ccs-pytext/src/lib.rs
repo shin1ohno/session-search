@@ -62,6 +62,41 @@ fn map_case(s: &str, table: &[(u32, &str)]) -> String {
 pub fn casefold(s: &str) -> String {
     map_case(s, tables::CASEFOLD)
 }
+/// Python strings can contain lone surrogates; keep them as code points.
+pub fn is_space_point(c: u32) -> bool {
+    char::from_u32(c).is_some_and(is_space)
+}
+pub fn lstrip_points(s: &[u32]) -> &[u32] {
+    &s[s.iter()
+        .position(|&c| !is_space_point(c))
+        .unwrap_or(s.len())..]
+}
+pub fn strip_points(s: &[u32]) -> &[u32] {
+    let start = s
+        .iter()
+        .position(|&c| !is_space_point(c))
+        .unwrap_or(s.len());
+    let end = s
+        .iter()
+        .rposition(|&c| !is_space_point(c))
+        .map_or(start, |i| i + 1);
+    &s[start..end]
+}
+pub fn split_points(s: &[u32]) -> Vec<&[u32]> {
+    s.split(|&c| is_space_point(c))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+pub fn casefold_points(s: &[u32]) -> Vec<u32> {
+    let mut out = Vec::new();
+    for &c in s {
+        match tables::CASEFOLD.binary_search_by_key(&c, |&(cp, _)| cp) {
+            Ok(i) => out.extend(tables::CASEFOLD[i].1.chars().map(u32::from)),
+            Err(_) => out.push(c),
+        }
+    }
+    out
+}
 pub fn decode_replace(s: &[u8]) -> String {
     String::from_utf8_lossy(s).into_owned()
 }
