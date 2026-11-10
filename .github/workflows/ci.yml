@@ -48,6 +48,8 @@ jobs:
           python3 tools/test_crosscheck.py
           python3 tools/test_lock.py target/release/examples/lock_probe
           python3 tools/test_workflow.py
+      - name: Resume function Python differential gate
+        run: python3 crates/ccs/tests/resume_oracle.py
   dependency-policy:
     runs-on: ubuntu-22.04
     steps:
