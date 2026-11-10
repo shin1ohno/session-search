@@ -1,5 +1,6 @@
 """Regression cases for edge semantics at the local-reading adapter boundary."""
 import importlib.util
+import itertools
 import json
 import os
 from pathlib import Path
@@ -104,9 +105,13 @@ with tempfile.TemporaryDirectory(prefix='ccs-review-') as home:
     sid = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
     def rollout(i):
         return native / ('rollout-2026-11-10T00-00-00-%08d-0000-0000-0000-000000000000.jsonl' % i)
+    sequence = itertools.count(1)
     def write(path, rows, tail=b''):
         path.write_bytes(b''.join((json.dumps(row) + '\n').encode() for row in rows) + tail)
-        os.utime(path, ns=(1700000000000000000, 1700000000000000000))
+        # Separate rg processes may enumerate equal-mtime files differently.
+        # Give filter fixtures unique timestamps; test stable ties explicitly below.
+        stamp = 1700000000000000000 + next(sequence) * 1_000_000_000
+        os.utime(path, ns=(stamp, stamp))
     def scan_case(path, query='needle'):
         add('scan/' + path.name, {'op': 'scan', 'input': str(path), 'query': query}, snapshot(extract.scan(str(path), query)))
     # A real native rollout must retain the searchable message despite tool
@@ -149,7 +154,7 @@ with tempfile.TemporaryDirectory(prefix='ccs-review-') as home:
     scan_case(path)
     headless = project / 'headless.jsonl'
     write(headless, [user('needle', cwd='/headless', entrypoint='sdk')])
-    for opts in [{'query': 'needle', 'exclude_session_id': sid}, {'query': 'needle', 'since_epoch': 1700000001}, {'query': 'needle'}, {'query': 'needle', 'include_headless': True}]:
+    for opts in [{'query': 'needle', 'exclude_session_id': sid}, {'query': 'needle', 'since_epoch': 1700000100}, {'query': 'needle', 'since_epoch': 1700000005}, {'query': 'needle', 'since_epoch': path.stat().st_mtime}, {'query': 'needle'}, {'query': 'needle', 'include_headless': True}]:
         add('search-filters', {'op': 'search', 'input': opts}, [snapshot(s) for s in fallback.search(**opts)])
     # Keep the old file first so a nanosecond quantization tie reverses the result.
     older, newer = project / 'older.txt', project / 'newer.txt'
@@ -158,6 +163,12 @@ with tempfile.TemporaryDirectory(prefix='ccs-review-') as home:
         os.utime(path, ns=(ns, ns))
     assert older.stat().st_mtime < newer.stat().st_mtime
     add('mtime-order', {'op': 'newest', 'input': [str(older), str(newer)]}, fallback._newest([str(older), str(newer)], None))
+    tie_a, tie_b = project / 'tie-a.txt', project / 'tie-b.txt'
+    for path in [tie_a, tie_b]:
+        path.touch()
+        os.utime(path, ns=(1700000000000000000, 1700000000000000000))
+    ties = [str(tie_b), str(tie_a)]
+    add('mtime-stable-ties', {'op': 'newest', 'input': ties}, fallback._newest(ties, None))
     for path, root in [(project / 'missing', project), (project / 'missing/../present', project), (project, project), (project, Path('/')), (project / 'missing/child', project / 'missing')]:
         add('non-strict-realpath', {'op': 'is_within', 'input': str(path), 'root': str(root)}, util.is_within(str(path), str(root)))
     count += check(cases)
