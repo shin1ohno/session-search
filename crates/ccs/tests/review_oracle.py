@@ -134,6 +134,11 @@ with tempfile.TemporaryDirectory(prefix='ccs-review-') as home:
         add('deep-metadata', {'op': 'metadata', 'input': str(path)}, codex.metadata(str(path)))
         add('metadata-classify', {'op': 'classify', 'input': str(path)}, codex.classify(str(path)))
         add('metadata-find', {'op': 'find_local', 'input': meta['id'], 'hint': str(path)}, codex.find_local(meta['id'], str(path)))
+    path = rollout(12)
+    meta = {'id': codex.ROLLOUT_RE.fullmatch(path.name).group(1), 'cwd': '/w\ud800'}
+    write(path, [{'type': 'session_meta', 'payload': meta}])
+    add('surrogate-cwd-classify', {'op': 'classify', 'input': str(path)}, codex.classify(str(path)))
+    add('surrogate-cwd-find', {'op': 'find_local', 'input': meta['id'], 'hint': str(path)}, codex.find_local(meta['id'], str(path)))
     for i, encoding in enumerate(['utf-8', 'utf-8-sig', 'utf-16-be', 'utf-16-le', 'utf-32-be', 'utf-32-le']):
         path = rollout(20 + i)
         raw = json.dumps({'type': 'session_meta', 'payload': {'id': 'x', 'cwd': '/w\ud800'}}, ensure_ascii=False)

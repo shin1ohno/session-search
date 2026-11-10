@@ -287,6 +287,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn byte_decoder_detects_little_endian_and_rejects_truncation() {
+        let text = "{\"cwd\":\"/work\"}\n";
+        let points: Vec<_> = text.chars().map(u32::from).collect();
+        let utf32: Vec<_> = points.iter().flat_map(|cp| cp.to_le_bytes()).collect();
+        let utf16: Vec<_> = text
+            .encode_utf16()
+            .flat_map(|cp| cp.to_le_bytes())
+            .collect();
+        assert_eq!(decode_metadata(&utf32), Some(points.clone()));
+        assert_eq!(decode_metadata(&utf16), Some(points));
+        for bytes in [&b"\xed"[..], &b"\xed\xa0"[..], &b"\xed\xa0\n"[..]] {
+            assert_eq!(decode_metadata(bytes), None);
+        }
+    }
+    #[test]
     fn find_local_reads_only_the_matching_header_and_uses_hint_lazily() {
         let sid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
         let target = PathBuf::from(format!("rollout-2026-10-25T00-00-00-{sid}.jsonl"));
