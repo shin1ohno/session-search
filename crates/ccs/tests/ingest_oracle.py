@@ -217,6 +217,11 @@ def suite(binary, selected=None):
             f.pair(name)
         f.state.write_text('{"version":9,"files":[]}')
         f.pair("invalid-state-reset")
+        f.path.write_bytes(LINE)
+        f.seed(offset=len(LINE))
+        state = json.loads(f.state.read_text()); state['version'] = 1.0
+        f.state.write_text(json.dumps(state))
+        f.pair("numeric-state-version")
     run("diff", diff)
 
     def segments(f):
@@ -239,6 +244,9 @@ def suite(binary, selected=None):
                  ("409-missing", 409, {}, 1),
                  ("413-halving", 413, {}, 2),
                  ("422-lines-offsets", 422, {"lines": [1, 3], "kinds": ["example"]}, 1),
+                 ("422-unicode-kinds", 422, {"lines": [0], "kinds": ["日本"]}, 1),
+                 ("422-string-kinds", 422, {"lines": [0], "kinds": "kind"}, 1),
+                 ("422-invalid-kinds", 422, {"lines": [0], "kinds": 7}, 1),
                  ("422-invalid-index", 422, {"lines": [9], "kinds": []}, 1),
                  ("422-empty", 422, {"lines": []}, 1),
                  ("422-repeated", 422, {"lines": [0]}, 3),

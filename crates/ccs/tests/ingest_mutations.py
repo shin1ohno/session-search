@@ -10,6 +10,9 @@ import tempfile
 REPO = Path(__file__).resolve().parents[3]
 # Each mutation changes production code, not the oracle or a fake API result.
 MUTATIONS = [
+    ('tombstone-ascii', 'statuses', 'json::dumps_compact(value, true, false)', 'json::dumps_compact(value, false, false)'),
+    ('kinds-iterable', 'statuses', 'let kinds = match kinds {', 'let kinds = match kinds { Value::String(_) => return Err(util::invalid("not iterable")),'),
+    ('numeric-version', 'diff', 'crate::config::number(get(&data, "version")) == Some(1.0)', 'integer(get(&data, "version")) == Some(1)'),
     ('mask-bypass', 'basics', 'lines.push(output);', 'lines.push(String::from_utf8_lossy(raw).into_owned());'),
     ('key-whitespace', 'basics', 'v[start..end].to_vec()', 'v[..].to_vec()'),
     ('cursor', 'basics', 'set(entry, "offset", next);', 'set(entry, "offset", number(999999));'),

@@ -71,13 +71,28 @@ fn digest(bytes: &[u8]) -> String {
         .collect()
 }
 fn compact(value: &Value) -> Result<String> {
-    json::dumps_compact(value, false, false).map_err(|_| util::invalid("invalid ingest JSON"))
+    json::dumps_compact(value, true, false).map_err(|_| util::invalid("invalid ingest JSON"))
 }
 fn tombstone(reason: &str, kinds: &Value, offset: u64) -> Result<String> {
+    // Python's list(kinds) accepts sequences and dictionary keys, and the
+    // tombstone itself uses ensure_ascii=True even though the HTTP JSON does not.
+    let kinds = match kinds {
+        Value::Array(_) => kinds.clone(),
+        Value::String(points) => {
+            Value::Array(points.iter().map(|p| Value::String(vec![*p])).collect())
+        }
+        Value::Object(items) => Value::Array(
+            items
+                .iter()
+                .map(|(key, _)| Value::String(key.clone()))
+                .collect(),
+        ),
+        _ => return Err(util::invalid("invalid tombstone kinds")),
+    };
     compact(&object([
         ("type", string("session-search-tombstone")),
         ("reason", string(reason)),
-        ("kinds", kinds.clone()),
+        ("kinds", kinds),
         ("line_offset", number(offset)),
     ]))
 }
@@ -174,7 +189,8 @@ struct State {
 impl State {
     fn load() -> Self {
         let mut data = util::read_json(&util::state_path(), Value::Null);
-        if integer(get(&data, "version")) != Some(1)
+        if !(crate::config::number(get(&data, "version")) == Some(1.0)
+            || matches!(get(&data, "version"), Value::Bool(true)))
             || !matches!(get(&data, "files"), Value::Object(_))
         {
             data = object([("version", number(1)), ("files", empty_object())]);
