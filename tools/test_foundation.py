@@ -112,6 +112,8 @@ def check_foundation():
                                     capture_output=True, text=True)
             output = (Path(work) / "gate.log").read_text()
             assert result.returncode != 0 and not ready.exists(), (mode, "invalid binary left ready")
+            refused = Path(work) / "refused.log"
+            assert refused.is_file() and refused.read_text() == output, (mode, "refusal evidence missing")
             assert reason in output, (mode, "wrong refusal reason", output[-500:])
             print("PASS negative publication binary:", mode, "refused; stale ready removed")
 
