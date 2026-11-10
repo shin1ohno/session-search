@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Exercise build identity, S2 redaction, and fail-closed publication eligibility."""
+"""Exercise build identity, both conformance suites, and publication eligibility."""
+import hashlib
 import json
 import os
 import re
@@ -32,6 +33,32 @@ def publication_guard(source):
     return first.split('        run: ',1)[1]
 
 
+def check_codex():
+    corpus = root / "vendor/memory-mcp/conformance/session_codex_v1.jsonl"
+    raw = corpus.read_bytes()
+    header, *vectors = [json.loads(line) for line in raw.splitlines()]
+    result = subprocess.run([binary, "_conformance", "codex"], input=raw,
+                            capture_output=True, check=True)
+    assert not result.stdout and b"failures=0" in result.stderr
+    emitted = subprocess.run([binary, "_conformance", "codex", "--emit"], input=raw,
+                             capture_output=True, check=True)
+    rows = [json.loads(line) for line in emitted.stdout.splitlines()]
+    expected = [{"id": v["id"], "result": v["expect"]} for v in vectors]
+    assert json.dumps(rows) == json.dumps(expected), "Codex emit values/types/key order differ"
+    assert len(rows) == header["vectors"] and len(rows) >= header["min_vectors"]
+    print("PASS Codex corpus and complete emit:", len(rows), "vectors")
+    # Repair the checksum so this tests behavior, not only corpus integrity.
+    vectors[0]["expect"]["type"] += "-incorrect"
+    body = b"".join((json.dumps(v) + "\n").encode() for v in vectors)
+    header["sha256_of_vectors"] = hashlib.sha256(body).hexdigest()
+    broken = (json.dumps(header) + "\n").encode() + body
+    result = subprocess.run([binary, "_conformance", "codex"], input=broken, capture_output=True)
+    assert result.returncode == 1 and not result.stdout
+    assert ('FAIL conformance: ' + json.dumps(vectors[0]["id"])).encode() in result.stderr
+    assert b"failures=1" in result.stderr
+    print("PASS negative Codex expected-value change: exact vector rejected with repaired checksum")
+
+
 def check_foundation():
     info = json.loads(subprocess.check_output([binary, "_buildinfo"]))
     assert len(info["commit"]) == 40 and info["version"] == "0.2.0"
@@ -40,25 +67,55 @@ def check_foundation():
         p = subprocess.run([binary, *args], capture_output=True, text=True)
         assert p.returncode == code and not p.stdout
         print("PASS empty/unsupported command refusal:", *args, "exit", p.returncode)
-    gate = [sys.executable, str(root / "tools/release_gate.py")]
-    p = subprocess.run([*gate, str(binary), info["commit"], info["target"]], capture_output=True, text=True)
-    assert p.returncode == 1 and 'conformance is not implemented in S1' in p.stderr
-    print(p.stderr.strip())
-    print("PASS publication gate refuses incomplete client")
     with tempfile.TemporaryDirectory() as work:
         ready = Path(work) / "ready"
-        ready.touch()
-        subprocess.run(["bash", str(root / "tools/stage_release.sh"), str(binary),
-                        info["commit"], info["target"], work], check=True)
-        assert not ready.exists()
-        print("PASS negative: stale publication marker removed after refused gate")
-        # A fake executable claims every suite passed but emits no vectors.
-        fake = Path(work) / "ccs"
-        fake.write_text('#!/bin/sh\nif [ "$1" = _buildinfo ]; then\ncat <<\'JSON\'\n' + json.dumps(info) + '\nJSON\nfi\n')
-        fake.chmod(0o755)
-        p = subprocess.run([*gate, str(fake), info["commit"], info["target"]], capture_output=True, text=True)
-        assert p.returncode == 1 and "missing or extra emit row" in p.stderr
-        print("PASS negative: always-success conformance rejected for missing output")
+        stage = ["bash", str(root / "tools/stage_release.sh")]
+        result = subprocess.run([*stage, str(binary), info["commit"], info["target"], work],
+                                capture_output=True, text=True, check=True)
+        assert ready.is_file() and not (Path(work) / "refused.log").exists()
+        assert "PASS publication gate" in (Path(work) / "gate.log").read_text()
+        print("PASS both corpus suites authorize a fresh ready marker")
+        # Each wrapper delegates every unaffected operation to the real binary.
+        # This isolates the missing or failing suite, preserving a valid identity.
+        for mode, reason in (("codex-fail", "exit status 35"),
+                             ("codex-empty", "missing or extra Codex emit row"),
+                             ("codex-missing", "missing or extra Codex emit row"),
+                             ("codex-extra", "missing or extra Codex emit row"),
+                             ("codex-order", "unknown, duplicate or out-of-order Codex emit id"),
+                             ("codex-wrong", "Codex output mismatch"),
+                             ("redact-empty", "missing or extra emit row")):
+            fake = Path(work) / "ccs"
+            code = "\n".join([
+                "#!" + sys.executable,
+                "import json, os, subprocess, sys",
+                "binary = " + repr(str(binary)), "mode = " + repr(mode),
+                "args = sys.argv[1:]",
+                "if args[:2] == ['_conformance', 'codex']:",
+                "    if mode == 'codex-fail': sys.exit(35)",
+                "    if mode == 'codex-empty': sys.exit(0)",
+                "    if mode in ('codex-missing', 'codex-extra', 'codex-order', 'codex-wrong') and args[2:] == ['--emit']:",
+                "        p = subprocess.run([binary, *args], capture_output=True, check=True)",
+                "        rows = [json.loads(line) for line in p.stdout.splitlines()]",
+                "        if mode == 'codex-missing': rows.pop()",
+                "        if mode == 'codex-extra': rows.append(rows[-1])",
+                "        if mode == 'codex-order': rows[0], rows[1] = rows[1], rows[0]",
+                "        if mode == 'codex-wrong': rows[0]['result']['type'] = 'incorrect'",
+                "        print(*[json.dumps(row) for row in rows], sep=chr(10))",
+                "        sys.exit(0)",
+                "if args[:2] == ['_conformance', 'redact'] and mode == 'redact-empty': sys.exit(0)",
+                "os.execv(binary, [binary, *args])", "",
+            ])
+            fake.write_text(code)
+            fake.chmod(0o755)
+            ready.touch()  # A stale result must be removed before this invocation.
+            result = subprocess.run([*stage, str(fake), info["commit"], info["target"], work],
+                                    capture_output=True, text=True)
+            output = (Path(work) / "gate.log").read_text()
+            assert result.returncode != 0 and not ready.exists(), (mode, "invalid binary left ready")
+            refused = Path(work) / "refused.log"
+            assert refused.is_file() and refused.read_text() == output, (mode, "refusal evidence missing")
+            assert reason in output, (mode, "wrong refusal reason", output[-500:])
+            print("PASS negative publication binary:", mode, "refused; stale ready removed")
 
     workflow = (root / ".github/workflows/release.yml").read_text()
     command = publication_guard(workflow)
@@ -87,5 +144,6 @@ def check_foundation():
 
 
 if __name__ == "__main__":
+    check_codex()
     check_foundation()
     subprocess.run([sys.executable, str(root / "tests/conformance/run.py"), str(binary)], check=True)

@@ -211,12 +211,17 @@ fn request(rs: &Redactor, v: &Value) -> Result<Value> {
 }
 
 fn run_inner(args: &[std::ffi::OsString]) -> Result<()> {
-    if args.first().is_none_or(|s| s != "redact") || args.len() > 2 {
-        return Err("unsupported conformance suite".into());
+    let suite = match args.first().and_then(|s| s.to_str()) {
+        Some("redact") => "redact",
+        Some("codex") => "codex",
+        _ => return Err("unsupported conformance suite".into()),
+    };
+    if args.len() > 2 {
+        return Err("unsupported conformance option".into());
     }
     let emit = args.get(1).is_some_and(|s| s == "--emit");
     let requests = args.get(1).is_some_and(|s| s == "--requests");
-    if args.len() == 2 && !emit && !requests {
+    if (args.len() == 2 && !emit && !requests) || (suite == "codex" && requests) {
         return Err("unsupported conformance option".into());
     }
     let rs = Redactor::new();
@@ -237,16 +242,32 @@ fn run_inner(args: &[std::ffi::OsString]) -> Result<()> {
     }
     let mut lines = stdin.lock().lines();
     let header = json::from_str(&lines.next().ok_or("missing corpus header")??)?;
-    if text(&header, "format")? != "ccs-redact-conformance/1"
-        || text(&header, "ruleset")? != ccs_redact::REDACT_VERSION
-        || text(&header, "source_blob")? != ccs_redact::REDACT_SOURCE_BLOB
+    let (format, ruleset, source_blob, floor) = if suite == "codex" {
+        // Git blob of the server-owned normalization oracle for v1.
+        (
+            "ccs-codex-conformance/1",
+            "v1",
+            "a267890c0b118caf41dfab83494c74da2b928d40",
+            100,
+        )
+    } else {
+        (
+            "ccs-redact-conformance/1",
+            ccs_redact::REDACT_VERSION,
+            ccs_redact::REDACT_SOURCE_BLOB,
+            8000,
+        )
+    };
+    if text(&header, "format")? != format
+        || text(&header, "ruleset")? != ruleset
+        || text(&header, "source_blob")? != source_blob
     {
         return Err("corpus identity mismatch".into());
     }
     let key = hex(&text(&header, "hmac_key_hex")?)?;
     let minimum = field(&header, "min_vectors")?.as_u64()?;
     let expected_count = field(&header, "vectors")?.as_u64()?;
-    if minimum < 8000 || expected_count < minimum {
+    if minimum < floor || expected_count < minimum {
         return Err("corpus count below minimum".into());
     }
     let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
@@ -268,10 +289,19 @@ fn run_inner(args: &[std::ffi::OsString]) -> Result<()> {
             .get("hmac_key_hex")
             .map(|v| hex(&v.as_str()?))
             .transpose()?;
-        let result = evaluate(&rs, &vector, vector_key.as_deref().unwrap_or(&key))?;
+        let result = if suite == "codex" {
+            ccs::session_codex::conformance_case(
+                &op,
+                field(&vector, "input")?,
+                vector.get("kwargs").unwrap_or(&Value::Null),
+            )
+            .map_err(|_| "Codex normalization failed")?
+        } else {
+            evaluate(&rs, &vector, vector_key.as_deref().unwrap_or(&key))?
+        };
         let expected = field(
             &vector,
-            if op == "mask_line" {
+            if suite == "redact" && op == "mask_line" {
                 "rust_expect"
             } else {
                 "expect"
@@ -285,7 +315,10 @@ fn run_inner(args: &[std::ffi::OsString]) -> Result<()> {
             );
             failures += 1;
         }
-        if emit && matches!(op.as_str(), "redact_text" | "redact_record" | "mask_line") {
+        if emit
+            && (suite == "codex"
+                || matches!(op.as_str(), "redact_text" | "redact_record" | "mask_line"))
+        {
             writeln!(
                 out,
                 "{}",
@@ -309,10 +342,14 @@ fn run_inner(args: &[std::ffi::OsString]) -> Result<()> {
     if count != expected_count || digest != text(&header, "sha256_of_vectors")? {
         return Err("corpus count or digest mismatch".into());
     }
-    eprintln!(
-        "conformance redact: vectors={count} failures={failures} emitted={emitted} pass_limit={}",
-        ccs_redact::MAX_PASSES
-    );
+    if suite == "codex" {
+        eprintln!("conformance codex: vectors={count} failures={failures} emitted={emitted}");
+    } else {
+        eprintln!(
+            "conformance redact: vectors={count} failures={failures} emitted={emitted} pass_limit={}",
+            ccs_redact::MAX_PASSES
+        );
+    }
     if failures != 0 {
         return Err("conformance mismatch".into());
     }
