@@ -4,7 +4,7 @@ use crate::errors::{Error, Result};
 use ccs_pytext::json::Value;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -82,7 +82,11 @@ impl Breaker {
     }
     fn write(&self, value: Value) -> Result<()> {
         let parent = self.path.parent().unwrap_or(Path::new("."));
-        std::fs::create_dir_all(parent).map_err(Error::Io)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .map_err(Error::Io)?;
         let mut nonce = [0; 16];
         ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut nonce)
             .map_err(|_| Error::Unavailable("breaker random source unavailable".into()))?;
@@ -153,5 +157,22 @@ mod tests {
             Some(0.0)
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn newly_created_state_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("ccs-breaker-mode-{}-{}", std::process::id(), now()));
+        let path = root.join("leaf/breaker.json");
+        Breaker::new(&path).record_failure_at(100.0).unwrap();
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

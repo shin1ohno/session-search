@@ -54,8 +54,8 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<Value> {
 pub(crate) fn encode(value: &Value) -> Result<String> {
     json::dumps_compact(value, false, false).map_err(|_| Error::Usage("invalid JSON value".into()))
 }
-fn required(value: &Value, name: &str) -> Result<String> {
-    field(value, name)
+fn required(value: &Value, key: &str, name: &str) -> Result<String> {
+    field(value, key)
         .and_then(string)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| Error::Usage(format!("config: `{name}` is missing")))
@@ -109,20 +109,21 @@ impl Config {
         if !matches!(data, Value::Object(_)) {
             return Err(Error::Usage("config: top level must be an object".into()));
         }
-        let auth = field(data, "auth")
-            .filter(|v| matches!(v, Value::Object(_)))
-            .ok_or_else(|| Error::Usage("config: `auth` must be an object".into()))?;
-        let auth_type = required(auth, "type")?;
-        let tailnet = auth_type == "tailnet";
-        if !tailnet && auth_type != "client_credentials" {
-            return Err(Error::Usage(
-                "config: `auth.type` must be \"tailnet\" or \"client_credentials\"".into(),
-            ));
-        }
-        let endpoint = check_url(required(data, "endpoint")?, "endpoint", tailnet)?;
-        let host_label = required(data, "host_label")?;
-        if host_label.len() > 63
-            || !host_label
+        let auth_raw = field(data, "auth");
+        let tailnet = auth_raw
+            .and_then(|auth| field(auth, "type"))
+            .and_then(string)
+            .as_deref()
+            == Some("tailnet");
+        let endpoint = check_url(required(data, "endpoint", "endpoint")?, "endpoint", tailnet)?;
+        let host_label = field(data, "host_label")
+            .and_then(string)
+            .unwrap_or_default();
+        // Python's anchored regex accepts one final newline before `$`.
+        let checked_host = host_label.strip_suffix('\n').unwrap_or(&host_label);
+        if checked_host.is_empty()
+            || checked_host.len() > 63
+            || !checked_host
                 .bytes()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
         {
@@ -130,9 +131,25 @@ impl Config {
                 "config: `host_label` must match ^[a-z0-9-]{1,63}$".into(),
             ));
         }
+        let auth = auth_raw
+            .filter(|v| matches!(v, Value::Object(_)))
+            .ok_or_else(|| Error::Usage("config: `auth` must be an object".into()))?;
+        let auth_type = field(auth, "type").and_then(string).unwrap_or_default();
+        if !tailnet && auth_type != "client_credentials" {
+            return Err(Error::Usage(
+                "config: `auth.type` must be \"tailnet\" or \"client_credentials\"".into(),
+            ));
+        }
         let (token_url, client_id, secret_file, audience) = if tailnet {
             (String::new(), String::new(), PathBuf::new(), String::new())
         } else {
+            let token_url = check_url(
+                required(auth, "token_url", "auth.token_url")?,
+                "auth.token_url",
+                false,
+            )?;
+            let client_id = required(auth, "client_id", "auth.client_id")?;
+            let secret_file = expand(&required(auth, "secret_file", "auth.secret_file")?);
             let audience = match field(auth, "audience") {
                 None => "memory".into(),
                 Some(Value::Null) => String::new(),
@@ -140,12 +157,7 @@ impl Config {
                     Error::Usage("config: `auth.audience` must be a string".into())
                 })?,
             };
-            (
-                check_url(required(auth, "token_url")?, "auth.token_url", false)?,
-                required(auth, "client_id")?,
-                expand(&required(auth, "secret_file")?),
-                audience,
-            )
+            (token_url, client_id, secret_file, audience)
         };
         Ok(Self {
             path: path.into(),
@@ -156,7 +168,7 @@ impl Config {
             client_id,
             secret_file,
             audience,
-            hmac_key_file: expand(&required(data, "hmac_key_file")?),
+            hmac_key_file: expand(&required(data, "hmac_key_file", "hmac_key_file")?),
         })
     }
     pub fn load(path: Option<&Path>) -> Result<Self> {
@@ -182,10 +194,15 @@ pub fn load(path: Option<&Path>) -> Result<Value> {
         Error::Usage(if e.kind() == std::io::ErrorKind::NotFound {
             format!("not configured: {} does not exist", path.display())
         } else {
-            "config unreadable".into()
+            format!(
+                "config {} unreadable ({})",
+                path.display(),
+                python_io_error_name(&e)
+            )
         })
     })?;
-    let mut data = parse(&raw).ok_or_else(|| Error::Usage("config is not valid JSON".into()))?;
+    let mut data = parse(&raw)
+        .ok_or_else(|| Error::Usage(format!("config {} is not valid JSON", path.display())))?;
     Config::from_value(&data, &path)?;
     if let Value::Object(items) = &mut data {
         items.retain(|(k, _)| {
@@ -199,6 +216,16 @@ pub fn load(path: Option<&Path>) -> Result<Value> {
         ));
     }
     Ok(data)
+}
+
+fn python_io_error_name(error: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::PermissionDenied => "PermissionError",
+        ErrorKind::IsADirectory => "IsADirectoryError",
+        ErrorKind::NotADirectory => "NotADirectoryError",
+        _ => "OSError",
+    }
 }
 
 #[cfg(test)]

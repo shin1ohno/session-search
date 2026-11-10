@@ -85,7 +85,7 @@ class TokenCacheContract(test_auth.AuthContract):
         secret.unlink()
         before = len(self.server.of("/status"))
         result = self.run_ccs("status")
-        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 3)
         self.assertEqual(len(self.server.of("/status")), before)
         self.assert_clean(result)
 

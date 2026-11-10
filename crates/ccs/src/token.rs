@@ -10,6 +10,11 @@
 //! invalidation is conditional and best effort. An unwritable cache cannot
 //! provide a rejection registry across processes. Cross-process wall-clock
 //! rollback cannot be fully detected; in-process lifetimes use Instant as well.
+//! A different process may send an undeletable rejected disk value once, then
+//! fetch fresh; each process refuses its rejected values and retries the API once.
+//! During atomic save one protected temporary inode contains the token; handled
+//! failures remove it, and a later save safely removes orphans left by process death.
+//! Tokens whose expiry is unknown or has at most 60 seconds are used for one send.
 use crate::config::{encode, field, number, object, parse, string, text, Config};
 use crate::errors::{Error, Result};
 use ccs_pytext::json::Value;
@@ -47,7 +52,10 @@ fn fingerprint(bytes: &[u8]) -> String {
 fn warn_cache() {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
-        eprintln!("ccs: token cache unavailable or unsafe; continuing without cache");
+        let _ = writeln!(
+            io::stderr(),
+            "ccs: token cache unavailable or unsafe; continuing without cache"
+        );
     }
 }
 fn invalid() -> io::Error {
@@ -64,7 +72,7 @@ impl Credential {
         let read = || -> io::Result<Self> {
             let file = OpenOptions::new()
                 .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
                 .open(&config.secret_file)?;
             let meta = file.metadata()?;
             if !meta.is_file() || meta.len() > MAX_CACHE {
@@ -102,7 +110,7 @@ impl Credential {
                 generation: fingerprint(&bytes),
             })
         };
-        read().map_err(|_| Error::Usage("client secret unreadable or empty".into()))
+        read().map_err(|_| Error::Unavailable("client secret unreadable or empty".into()))
     }
 }
 
@@ -208,6 +216,20 @@ impl Token {
             && self
                 .budget
                 .is_none_or(|b| monotonic.saturating_duration_since(self.start) < b)
+    }
+    fn valid_first_send_at(&self, now: f64, monotonic: Instant) -> bool {
+        now.is_finite()
+            && self.obtained <= now + 300.0
+            && self.expires.is_none_or(|end| now < end)
+            && self.budget.is_none_or(|reuse_budget| {
+                monotonic.saturating_duration_since(self.start)
+                    < reuse_budget
+                        + if self.reusable {
+                            Duration::from_secs(60)
+                        } else {
+                            Duration::ZERO
+                        }
+            })
     }
     fn decode(value: &Value, key: &Key, now: f64, start: Instant) -> Option<Self> {
         if field(value, "format").and_then(number) != Some(1.0) || !key.matches(value) {
@@ -376,7 +398,7 @@ impl TokenManager {
                         ));
                     }
                     let token = Token::fresh(value, ttl, key, obtained, start);
-                    if !token.valid_at(epoch(), Instant::now()) {
+                    if !token.valid_first_send_at(epoch(), Instant::now()) {
                         return Err(Error::Unavailable(
                             "token expired before request could be sent".into(),
                         ));
@@ -569,6 +591,9 @@ impl Directory {
         }
     }
     fn save(&self, token: &Token) -> io::Result<()> {
+        if !token.valid_at(epoch(), Instant::now()) {
+            return Ok(());
+        }
         let Some(value) = token.json() else {
             return Ok(());
         };
@@ -1111,5 +1136,180 @@ mod tests {
             inode,
             "persistent lock inode changed"
         );
+    }
+    #[test]
+    fn missing_credential_is_unavailable() {
+        let f = Fixture::new();
+        std::fs::remove_file(&f.config.secret_file).unwrap();
+        let error = Credential::read(&f.config)
+            .err()
+            .expect("missing credential accepted");
+        assert_eq!(
+            error.exit_status().code(),
+            3,
+            "credential error must map to unavailable"
+        );
+    }
+    #[test]
+    fn credential_symlink_follows_current_target() {
+        let f = Fixture::new();
+        let target = f.root.join("actual.secret");
+        std::fs::rename(&f.config.secret_file, &target).unwrap();
+        symlink(&target, &f.config.secret_file).unwrap();
+        assert!(
+            Credential::read(&f.config).is_ok(),
+            "credential symlink refused"
+        );
+    }
+    #[test]
+    fn fresh_grant_margin_applies_only_to_reuse() {
+        let f = Fixture::new();
+        let start = Instant::now();
+        let token = Token::fresh(SYNTHETIC.into(), Some(61.0), f.key(), 1000.0, start);
+        assert!(
+            token.valid_first_send_at(1001.3, start + Duration::from_millis(1300)),
+            "fresh grant lost its first send to the reuse margin"
+        );
+        assert!(!token.valid_at(1001.3, start + Duration::from_millis(1300)));
+        assert!(!token.valid_first_send_at(1061.0, start + Duration::from_secs(61)));
+    }
+    #[test]
+    fn memory_wall_clock_margin_is_independent_of_monotonic_budget() {
+        let f = Fixture::new();
+        let start = Instant::now();
+        let token = Token::fresh(SYNTHETIC.into(), Some(3600.0), f.key(), 1000.0, start);
+        assert!(
+            !token.valid_at(4570.0, start),
+            "forward wall clock lost the expiry margin"
+        );
+    }
+    #[test]
+    fn negative_obtained_time_is_invalid() {
+        let f = Fixture::new();
+        let mut value = f.token().json().unwrap();
+        set(&mut value, "obtained_at", Value::Number("-50".into()));
+        set(&mut value, "expires_at", Value::Number("1000".into()));
+        assert!(
+            Token::decode(&value, &f.key(), 0.0, Instant::now()).is_none(),
+            "negative obtained time accepted"
+        );
+    }
+    #[test]
+    fn disk_remaining_lifetime_is_bounded_after_clock_rollback() {
+        let f = Fixture::new();
+        let mut value = f.token().json().unwrap();
+        set(&mut value, "obtained_at", Value::Number("1200".into()));
+        set(&mut value, "expires_at", Value::Number("4800".into()));
+        assert!(
+            Token::decode(&value, &f.key(), 1000.0, Instant::now()).is_none(),
+            "remaining lifetime exceeds maximum"
+        );
+    }
+    #[test]
+    fn replacing_credential_with_same_bytes_changes_generation() {
+        let f = Fixture::new();
+        let original = Credential::read(&f.config).unwrap();
+        let replacement = f.root.join("new.secret");
+        std::fs::write(&replacement, std::fs::read(&f.config.secret_file).unwrap()).unwrap();
+        std::fs::rename(&replacement, &f.config.secret_file).unwrap();
+        let current = Credential::read(&f.config).unwrap();
+        assert!(
+            original.generation != current.generation,
+            "identical-byte credential rotation ignored metadata"
+        );
+    }
+    #[test]
+    fn rejected_disk_value_is_not_removed_without_lock() {
+        let f = Fixture::new();
+        f.save();
+        let mut manager = f.get();
+        let dir = Directory::open(&f.root).unwrap();
+        let lock = dir.lock().unwrap();
+        let config = f.config.clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            manager.reject(&config);
+            sent.send(()).unwrap();
+        });
+        assert!(
+            received.recv_timeout(Duration::from_millis(500)).is_err(),
+            "invalidation bypassed the held flock"
+        );
+        assert!(f.root.join("token.json").exists());
+        drop(lock);
+        worker.join().unwrap();
+        assert!(!f.root.join("token.json").exists());
+    }
+    #[test]
+    fn manager_refuses_unsafe_granted_bearer() {
+        let f = Fixture::new();
+        let mut manager = TokenManager::default();
+        assert!(
+            manager
+                .acquire(&f.config, false, |_| Ok((
+                    "invalid bearer".into(),
+                    Some(3599.0)
+                )))
+                .is_err(),
+            "manager accepted unsafe bearer"
+        );
+    }
+    #[test]
+    fn group_or_other_writable_ancestor_is_rejected() {
+        let f = Fixture::new();
+        let parent = f.root.join("ancestor");
+        let leaf = parent.join("cache");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for mode in [0o720, 0o702] {
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                Directory::open(&leaf).is_err(),
+                "writable ancestor accepted"
+            );
+        }
+    }
+    #[test]
+    #[ignore = "run as root to exercise a readable file owned by a different user"]
+    fn root_foreign_file_owner_is_rejected() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let f = Fixture::new();
+        f.save();
+        let path = CString::new(f.root.join("token.json").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chown(path.as_ptr(), 65534, !0) }, 0);
+        let dir = Directory::open(&f.root).unwrap();
+        assert!(
+            dir.read_token(&f.key(), &[]).is_none(),
+            "foreign-owned readable cache accepted"
+        );
+    }
+    #[test]
+    #[ignore = "run as root to create a foreign-owned traversable ancestor"]
+    fn root_foreign_ancestor_owner_is_rejected() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let f = Fixture::new();
+        let parent = f.root.join("ancestor");
+        let leaf = parent.join("cache");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = CString::new(parent.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chown(path.as_ptr(), 65534, !0) }, 0);
+        assert!(
+            Directory::open(&leaf).is_err(),
+            "foreign-owned ancestor accepted"
+        );
+    }
+    #[test]
+    #[ignore = "run as root to create a root-owned sticky ancestor"]
+    fn root_sticky_ancestor_is_allowed() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let f = Fixture::new();
+        let parent = f.root.join("ancestor");
+        let leaf = parent.join("cache");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(Directory::open(&leaf).is_ok(), "root sticky exemption lost");
     }
 }

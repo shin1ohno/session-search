@@ -6,6 +6,7 @@ use base64::Engine;
 use ccs_pytext::json::Value;
 use std::io::{Read, Write};
 use std::time::Duration;
+use ureq::AsSendBody;
 
 pub const USER_AGENT: &str = concat!("ccs/", env!("CARGO_PKG_VERSION"));
 
@@ -40,6 +41,8 @@ impl Api {
     }
     pub fn with_timeout(config: Config, timeout: Duration) -> Self {
         let agent = ureq::Agent::config_builder()
+            .proxy(None)
+            .accept_encoding("identity")
             .max_redirects(0)
             .max_redirects_will_error(false)
             .http_status_as_error(false)
@@ -206,7 +209,8 @@ fn send(
         .method(method)
         .uri(url)
         .header("Accept", "application/json")
-        .header("User-Agent", USER_AGENT);
+        .header("User-Agent", USER_AGENT)
+        .header("Connection", "close");
     for (key, value) in headers {
         let mut value = ureq::http::HeaderValue::from_str(value)
             .map_err(|_| Error::Unavailable("invalid HTTP header".into()))?;
@@ -215,19 +219,37 @@ fn send(
         }
         request = request.header(*key, value);
     }
+    let mut data = data;
+    let mut absent = ();
+    let payload = if data.is_empty() && matches!(method, "GET" | "HEAD") {
+        absent.as_body()
+    } else {
+        data.as_body()
+    };
     let request = request
-        .body(data)
+        .body(payload)
         .map_err(|_| Error::Unavailable("invalid HTTP request".into()))?;
+    let proxy = proxy_for_url(url, |name| std::env::var(name).ok())?;
+    let uses_tls = url.starts_with("https:")
+        || proxy
+            .as_ref()
+            .is_some_and(|p| p.protocol() == ureq::ProxyProtocol::Https);
     let request = agent
         .configure_request(request)
+        .proxy(proxy)
+        .tls_config(if uses_tls {
+            tls_from_env()?
+        } else {
+            ureq::tls::TlsConfig::default()
+        })
         .timeout_global(None)
         .timeout_per_call(None)
         .timeout_resolve(Some(timeout))
         .timeout_connect(Some(timeout))
         .timeout_send_request(Some(timeout))
-        .timeout_send_body(Some(timeout))
+        .timeout_send_body(None)
         .timeout_recv_response(Some(timeout))
-        .timeout_recv_body(Some(timeout))
+        .timeout_recv_body(None)
         .timeout_per_read(Some(timeout))
         .timeout_per_write(Some(timeout))
         .build();
@@ -253,6 +275,84 @@ fn send(
         headers,
         body,
     })
+}
+
+// urllib gives a present lowercase value (even empty) precedence over uppercase.
+// ALL_PROXY is deliberately never consulted. CGI HTTP_PROXY is untrusted.
+fn proxy_for_url(url: &str, env: impl Fn(&str) -> Option<String>) -> Result<Option<ureq::Proxy>> {
+    let uri = url
+        .parse::<ureq::http::Uri>()
+        .map_err(|_| Error::Unavailable("invalid HTTP URL".into()))?;
+    let scheme = uri.scheme_str().unwrap_or("");
+    let setting = |name: &str| env(name).or_else(|| env(&name.to_ascii_uppercase()));
+    if setting("no_proxy").is_some_and(|value| bypass_proxy(&uri, &value)) {
+        return Ok(None);
+    }
+    let lower = format!("{scheme}_proxy");
+    let selected = env(&lower).or_else(|| {
+        if scheme == "http" && env("REQUEST_METHOD").is_some() {
+            None
+        } else {
+            env(&lower.to_ascii_uppercase())
+        }
+    });
+    selected
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            ureq::Proxy::new(&s)
+                .map_err(|_| Error::Unavailable("invalid proxy configuration".into()))
+        })
+        .transpose()
+}
+fn bypass_proxy(uri: &ureq::http::Uri, exclusions: &str) -> bool {
+    if exclusions == "*" {
+        return true;
+    }
+    let host = uri.host().unwrap_or("").to_ascii_lowercase();
+    let authority = uri
+        .authority()
+        .map(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    exclusions.split(',').any(|entry| {
+        let name = entry.trim().trim_start_matches('.').to_ascii_lowercase();
+        !name.is_empty()
+            && (host == name
+                || authority == name
+                || host.ends_with(&format!(".{name}"))
+                || authority.ends_with(&format!(".{name}")))
+    })
+}
+fn tls_from_env() -> Result<ureq::tls::TlsConfig> {
+    tls_from_file(
+        std::env::var_os("SSL_CERT_FILE")
+            .as_deref()
+            .map(std::path::Path::new),
+    )
+}
+fn tls_from_file(path: Option<&std::path::Path>) -> Result<ureq::tls::TlsConfig> {
+    let Some(path) = path else {
+        return Ok(ureq::tls::TlsConfig::default());
+    };
+    let bytes =
+        std::fs::read(path).map_err(|_| Error::Unavailable("SSL_CERT_FILE unreadable".into()))?;
+    let mut certificates = Vec::new();
+    for item in ureq::tls::parse_pem(&bytes) {
+        if let ureq::tls::PemItem::Certificate(cert) =
+            item.map_err(|_| Error::Unavailable("SSL_CERT_FILE invalid PEM".into()))?
+        {
+            certificates.push(cert);
+        }
+    }
+    if certificates.is_empty() {
+        return Err(Error::Unavailable(
+            "SSL_CERT_FILE contains no certificates".into(),
+        ));
+    }
+    // Specific replaces WebPki; it never augments the built-in roots.
+    Ok(ureq::tls::TlsConfig::builder()
+        .root_certs(certificates.into())
+        .build())
 }
 
 fn quote(value: &str, plus: bool) -> String {
@@ -407,5 +507,212 @@ mod transport_tests {
         );
         assert!(result.is_err(), "stalled HTTP response did not time out");
         server.join().unwrap();
+    }
+    fn response_server(body: Vec<u8>, gap: Duration) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let task = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut request_body = vec![0; length];
+            reader.read_exact(&mut request_body).unwrap();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if stream.write_all(header.as_bytes()).is_err() {
+                return;
+            }
+            for chunk in body.chunks(if gap.is_zero() { body.len().max(1) } else { 10 }) {
+                std::thread::sleep(gap);
+                if stream.write_all(chunk).is_err() {
+                    return;
+                }
+            }
+        });
+        (address, task)
+    }
+    #[test]
+    fn progressing_body_uses_per_read_timeout() {
+        let (endpoint, server) = response_server(vec![b' '; 80], Duration::from_millis(100));
+        let result = Api::with_timeout(config(endpoint), Duration::from_millis(300)).get(
+            "/archive",
+            &[],
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "whole-body timeout interrupted progressing response"
+        );
+        server.join().unwrap();
+    }
+    #[test]
+    fn network_path_is_rejected_before_any_send() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while start.elapsed() < Duration::from_millis(500) {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                            break;
+                        }
+                    }
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        )
+                        .unwrap();
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            false
+        });
+        let result = Api::new(config(endpoint)).get("//other/path", &[], None);
+        assert!(!server.join().unwrap(), "network path reached server");
+        assert!(matches!(result, Err(Error::Usage(_))));
+    }
+    fn fetch_response(body: Vec<u8>) -> Result<(String, Option<f64>)> {
+        let (endpoint, server) = response_server(body, Duration::ZERO);
+        let mut cfg = config(endpoint.clone());
+        cfg.token_url = endpoint;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("ccs-api-secret-{}-{nonce}", std::process::id()));
+        std::fs::write(&path, "synthetic-client-secret").unwrap();
+        cfg.secret_file = path.clone();
+        let credential = Credential::read(&cfg).unwrap();
+        let result = fetch_token(
+            &Api::new(cfg.clone()).agent,
+            &cfg,
+            &credential,
+            Duration::from_secs(3),
+        );
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+        result
+    }
+    #[test]
+    fn token_endpoint_response_is_size_bounded() {
+        let mut body = br#"{"access_token":"synthetic-safe","expires_in":3600}"#.to_vec();
+        body.resize(32769, b' ');
+        let result = fetch_response(body);
+        assert!(
+            matches!(result, Err(Error::Unavailable(ref reason)) if reason == "token endpoint response too large"),
+            "oversized token response accepted"
+        );
+    }
+    #[test]
+    fn token_fetch_validates_bearer_before_returning() {
+        let result =
+            fetch_response(br#"{"access_token":"invalid bearer","expires_in":3600}"#.to_vec());
+        assert!(
+            matches!(result, Err(Error::Unavailable(ref reason)) if reason == "token endpoint answered 200 without a valid access_token"),
+            "unsafe bearer escaped fetch filter"
+        );
+    }
+    #[test]
+    fn proxy_selection_matches_urllib_environment_rules() {
+        let settings = [
+            ("HTTP_PROXY", "http://upper:81"),
+            ("http_proxy", "http://lower:82"),
+            ("https_proxy", "http://secure:83"),
+            ("ALL_PROXY", "http://all:84"),
+        ];
+        let env = |name: &str| {
+            settings
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+        };
+        assert_eq!(
+            proxy_for_url("http://destination", env)
+                .unwrap()
+                .unwrap()
+                .host(),
+            "lower"
+        );
+        assert_eq!(
+            proxy_for_url("https://destination", env)
+                .unwrap()
+                .unwrap()
+                .host(),
+            "secure"
+        );
+        assert!(
+            proxy_for_url("http://destination", |name| (name == "HTTPS_PROXY")
+                .then(|| "http://wrong:83".into()))
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            proxy_for_url("http://destination", |name| if name == "http_proxy" {
+                Some(String::new())
+            } else {
+                env(name)
+            })
+            .unwrap()
+            .is_none()
+        );
+        assert!(proxy_for_url("http://destination", |name| match name {
+            "HTTP_PROXY" => Some("http://upper".into()),
+            "REQUEST_METHOD" => Some("GET".into()),
+            _ => None,
+        })
+        .unwrap()
+        .is_none());
+        for (url, rule) in [
+            ("http://sub.example:80", ".example"),
+            ("http://localhost:99", "localhost:99"),
+            ("http://[::1]:99", "[::1]"),
+            ("http://example", "*"),
+        ] {
+            assert!(
+                bypass_proxy(&url.parse().unwrap(), rule),
+                "no_proxy bypass missing"
+            );
+        }
+        assert!(!bypass_proxy(
+            &"http://notexample".parse().unwrap(),
+            "example"
+        ));
+        assert!(!bypass_proxy(
+            &"http://localhost:99".parse().unwrap(),
+            "localhost:98"
+        ));
+    }
+    #[test]
+    fn custom_root_set_contains_only_bundle_certificates() {
+        let path = std::env::temp_dir().join(format!("ccs-ca-roots-{}", std::process::id()));
+        std::fs::write(
+            &path,
+            b"-----BEGIN CERTIFICATE-----\nYQ==\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let tls = tls_from_file(Some(&path)).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let ureq::tls::RootCerts::Specific(certs) = tls.root_certs() else {
+            panic!("custom bundle did not replace defaults");
+        };
+        assert_eq!(certs.len(), 1, "roots outside the bundle were trusted");
+        assert_eq!(certs[0].der(), b"a");
     }
 }
