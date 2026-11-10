@@ -111,26 +111,27 @@ equal the Python classes under the rules' flags; every table is sorted and
 disjoint, as the binary search in `lib.rs:56-68` requires; and `SOURCE_BLOB`
 (`crates/ccs-redact/src/tables.rs:1`) is the git blob of the vendored oracle.
 
-**Finding F1 (latent): the generator accepts trailing-`\b` shapes that the
-post-match check cannot translate.** `check_tail` (`tools/gen_redact_tables.py:223-233`)
-inspects only the last node before the trailing `\b`, and treats a lazy repeat
-like a greedy one. The generator accepted all three of these hypothetical rules
-and emitted `Boundary` guards for them; in each case the translated behaviour
-(anchored leftmost-first match, then the boundary check) finds no match where
-Python matches:
+**Finding F1 (latent defect in a gate): the generator accepts trailing-`\b`
+shapes that the post-match check cannot translate.** The generator is the gate
+that should reject any rule whose trailing `\b` cannot be checked after the
+match; its own description says it refuses any construct it cannot translate
+(`tools/gen_redact_tables.py:8-10`). `check_tail`
+(`tools/gen_redact_tables.py:223-233`) inspects only the last node before the
+trailing `\b` and treats a lazy repeat like a greedy one, so it accepts three
+shapes it should reject: a lazy repeat directly before the `\b`; a
+variable-width repeat followed by further fixed-width nodes; and an
+alternation whose alternatives differ in width. For each shape, hypothetical
+rules were accepted with `Boundary` guards, and the translated behaviour
+(anchored leftmost-first match, then the boundary check) finds no match on
+inputs where Python matches, so a translated rule of that shape would mask
+less. Table generation would not stop such a ruleset change; only the later
+differential gates could.
 
-| Hypothetical rule | Text | Python | Translation |
-|---|---|---|---|
-| `\bAKIA[A-Z0-9]{16,}?\b` (lazy repeat last) | `AKIA` + 20 × `B` | `[0, 24)` | no match |
-| `\bAIza[0-9A-Za-z_-]{2,4}[a-z]\b` (variable repeat, then one fixed node) | `AIzaa-b-cd` | `[0, 7)` | no match |
-| `\bAKIA(?:-B\|)\b` (alternatives of unequal width) | `AKIA-BC` | `[0, 4)` | no match |
-
-The generator's own description says it refuses any construct it cannot
-translate (`tools/gen_redact_tables.py:8-10`). It does not, so if the server's
-ruleset changes to one of these shapes, table generation will not stop it,
-and the masking difference would have to be caught by the later differential
-gates. No r1 rule has any of these shapes, and the shipped
-`aws-key` pattern used as a control translated correctly.
+r1 is not affected: its only rules with a trailing `\b` are `aws-key`,
+`github-token` and `google-api-key`, and in each the node before the `\b` is
+the last variable node, greedy, and either of fixed count or over word
+characters only (section 1). The shipped `aws-key` pattern, run through the
+same probe as a control, translated correctly.
 
 ## 3. JSON reader and writer
 
@@ -202,25 +203,25 @@ for the reasons their table states. `end-anchored` checks only that the repeat
 body is one node, not one character wide; this is harmless here because the
 only use is private-key's `[\s\S]*\Z`, which has no capture group.
 
-**Finding F2 (latent): `subsumed-optional` is unsound when the following
-unbounded repeat is lazy.** `subsumed_optional`
-(`classify_survivors.py:130-150`) checks that the optional group is followed
-by the last, unbounded repeat of its sequence and that the group's characters
-are inside that repeat's class, but not that the repeat is greedy. When it is
-lazy and the sequence is followed by more pattern outside it, the optional
-group changes the span. Run against the real predicate code:
-
-| Rule | Mutant | Text | Predicate | Original spans | Mutant spans |
-|---|---|---|---|---|---|
-| `(?:(?:ab)?[a-z]+?\|z)b` | `(?:ab)??` (swap-greed) | `abab` | `subsumed-optional` | `[0,4)` | `[0,2) [2,4)` |
-| same | `(?:ab){0,2}` (hi+1) | `ababab` | `subsumed-optional` | `[0,4) [4,6)` | `[0,6)` |
-| `(?:(?:ab)?[a-z]+\|z)b` (greedy control) | `(?:ab)??` | `abab` | `subsumed-optional` | `[0,4)` | `[0,4)` |
-
-In r1 the predicate's shape occurs only in `openai-key`
-(`(?:proj-)?[A-Za-z0-9_-]{20,}`), where the following repeat is greedy and ends
-the pattern, so its use there is sound. The predicate soundness gate
+**Finding F2 (latent defect in a gate): `subsumed-optional` accepts mutants
+that are not equivalent.** The equivalence classifier is the gate that should
+call a surviving mutant equivalent only when it cannot change any span.
+`subsumed_optional` (`classify_survivors.py:130-150`) checks that the optional
+group is followed by the last, unbounded repeat of its sequence and that the
+group's characters are inside that repeat's class, but not that the repeat is
+greedy. When that repeat is lazy and the sequence is followed by more pattern
+outside it, the optional group's mutants (`swap-greed`, `hi+1`) change the
+match span, yet the real predicate code classifies them as
+`subsumed-optional`. The same shape with a greedy repeat was classified the
+same way and was, correctly, equivalent. A non-equivalent survivor of this
+shape would be accepted unless the constructed-input hunt happened to find the
+difference. The predicate soundness gate
 (`tests/conformance/predicate_soundness.py:12-21`) cannot find this, because it
-only applies the predicates to mutants that some input already killed.
+applies the predicates only to mutants that some input already killed.
+
+r1 is not affected: the predicate's shape occurs only in `openai-key`
+(`(?:proj-)?[A-Za-z0-9_-]{20,}`), where the following repeat is greedy and ends
+the pattern, so its use there is sound.
 
 ## 7. Gates
 
