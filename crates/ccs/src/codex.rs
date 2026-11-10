@@ -297,6 +297,7 @@ mod tests {
             .collect();
         assert_eq!(decode_metadata(&utf32), Some(points.clone()));
         assert_eq!(decode_metadata(&utf16), Some(points));
+        assert_eq!(decode_metadata(b"\xed\xa0\x80"), Some(vec![0xd800]));
         for bytes in [&b"\xed"[..], &b"\xed\xa0"[..], &b"\xed\xa0\n"[..]] {
             assert_eq!(decode_metadata(bytes), None);
         }

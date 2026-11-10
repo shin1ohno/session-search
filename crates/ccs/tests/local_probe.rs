@@ -36,6 +36,9 @@ fn call(v: &Value) -> ccs::errors::Result<Value> {
             Value::String(s) => Ok(Value::String(ccs_pytext::casefold_points(s))),
             _ => Err(invalid("string required")),
         },
+        "strict_ok" => Ok(Value::Bool(
+            extract::loads_strict(&text(input).unwrap()).is_ok(),
+        )),
         "strict" => extract::loads_strict(&text(input).unwrap()),
         "classify" => Ok(codex::classify(Path::new(&text(input).unwrap())).unwrap_or(Value::Null)),
         "find_local" => Ok(codex::find_local(

@@ -28,8 +28,9 @@ def run_requests(requests, env=None):
         source.write_text("".join(json.dumps(r) + "\n" for r in requests))
         process_env = dict(os.environ if env is None else env,
                            CCS_ORACLE_REQUESTS=str(source), CCS_ORACLE_RESPONSES=str(destination))
-        subprocess.run([binary, "--ignored", "--exact", "json_probe"], env=process_env,
-                       stdout=subprocess.PIPE, check=True)
+        process = subprocess.run([binary, "--ignored", "--exact", "json_probe"], env=process_env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        assert process.returncode == 0, "Rust adapter failed:\n" + process.stdout
         result = [json.loads(line) for line in destination.read_text().splitlines()]
         assert len(result) == len(requests), (len(result), len(requests))
         return result

@@ -55,7 +55,7 @@ for _ in range(500):
     value = '2024-01-01T' + rng.choice(['12', '12:34', '12:34:56', '123456']) + rng.choice(['.', ':', ',', '.1234567x', '.1234567', 'x', '']) + rng.choice(['', '+05:00', '-07:12:34.5'])
     add('timestamp-fuzz', {'op': 'parse_ts', 'input': value}, util.parse_ts(value))
 
-for saved in [{'next_ordinal': -5}, {'next_ordinal': 2.0}, {'next_ordinal': True},
+for saved in [{'next_ordinal': float('inf')}, {'next_ordinal': float('-inf')}, {'next_ordinal': float('nan')}, {'start_ordinal': float('nan')}, {'next_ordinal': -5}, {'next_ordinal': 2.0}, {'next_ordinal': True},
               {'next_ordinal': -(10**100)}, {'next_ordinal': 10**100},
               {'start_ordinal': 2.5}, {'start_ordinal': -1}, [['next_ordinal', 7]],
               [['next_ordinal', 1], ['next_ordinal', 7]], {'next_ordinal': 9007199254740993, 'start_ordinal': 9007199254740992.0}]:
@@ -79,7 +79,7 @@ for tail in ['{"a":1,"a":2}', '{"number":' + '1' * 4301 + '}', '{"number":1}']:
         expected = extract.loads_strict(value)
     except ValueError:
         expected = {'error': True}
-    add('deep-strict', {'op': 'strict', 'input': value}, expected)
+    add('deep-strict', {'op': 'strict_ok', 'input': value}, expected != {'error': True})
 
 count = 0
 for home in ['', '/home/example///', None]:

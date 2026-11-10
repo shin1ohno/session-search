@@ -149,7 +149,16 @@ fn next_ordinal(value: &Value) -> Value {
         return Value::Null;
     };
     if !integer(s) {
-        return number(format!("{:?}", s.parse::<f64>().unwrap_or(f64::NAN) + 1.0));
+        let next = s.parse::<f64>().unwrap_or(f64::NAN) + 1.0;
+        return number(if next.is_nan() {
+            "NaN".to_owned()
+        } else if next == f64::INFINITY {
+            "Infinity".to_owned()
+        } else if next == f64::NEG_INFINITY {
+            "-Infinity".to_owned()
+        } else {
+            format!("{next:?}")
+        });
     }
     if let Some(negative) = s.strip_prefix('-').filter(|s| s.bytes().any(|b| b != b'0')) {
         let mut digits = negative.as_bytes().to_vec();
