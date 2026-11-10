@@ -52,9 +52,8 @@ fn fingerprint(bytes: &[u8]) -> String {
 fn warn_cache() {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
-        let _ = writeln!(
-            io::stderr(),
-            "ccs: token cache unavailable or unsafe; continuing without cache"
+        crate::util::stderr_line(
+            "ccs: token cache unavailable or unsafe; continuing without cache",
         );
     }
 }

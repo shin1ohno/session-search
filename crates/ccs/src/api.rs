@@ -49,14 +49,7 @@ impl Api {
         Self::with_timeout(config, Duration::from_secs(30))
     }
     pub fn with_timeout(config: Config, timeout: Duration) -> Self {
-        let agent = ureq::Agent::config_builder()
-            .proxy(None)
-            .accept_encoding("identity")
-            .max_redirects(0)
-            .max_redirects_will_error(false)
-            .http_status_as_error(false)
-            .build()
-            .new_agent();
+        let agent = agent_configuration(None, None).new_agent();
         Self {
             config,
             timeout,
@@ -485,6 +478,459 @@ pub fn request(config: &Value, method: &str, path: &str, body: Option<&Value>) -
         ("headers", headers),
         ("body", response.json().unwrap_or(Value::Null)),
     ]))
+}
+
+// Ordinary and pooled agents use the same wire policy. Only idle capacity differs.
+fn agent_configuration(
+    idle: Option<usize>,
+    tls: Option<ureq::tls::TlsConfig>,
+) -> ureq::config::Config {
+    let builder = ureq::Agent::config_builder()
+        .proxy(None)
+        .accept_encoding("identity")
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .http_status_as_error(false);
+    let builder = if let Some(tls) = tls {
+        builder.tls_config(tls)
+    } else {
+        builder
+    };
+    match idle {
+        Some(count) => builder.max_idle_connections_per_host(count).build(),
+        None => builder.build(),
+    }
+}
+fn bearer_digest(value: &str) -> [u8; 32] {
+    let digest = ring::digest::digest(&ring::digest::SHA256, value.as_bytes());
+    let mut hash = [0; 32];
+    hash.copy_from_slice(digest.as_ref());
+    hash
+}
+// Rebuilds caused by config changes must not forget a process-wide rejection.
+fn rejected_bearers() -> &'static std::sync::Mutex<std::collections::HashSet<[u8; 32]>> {
+    static REJECTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<[u8; 32]>>> =
+        std::sync::OnceLock::new();
+    REJECTED.get_or_init(Default::default)
+}
+fn recover_lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    // No network/file I/O happens under these locks. Preserve rejection history
+    // on poison; a panicking acquisition rebuilds its private TokenManager.
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+fn rejected(hash: &[u8; 32]) -> bool {
+    recover_lock(rejected_bearers()).contains(hash)
+}
+#[derive(Default)]
+struct PoolTokens {
+    manager: TokenManager,
+    last: Option<[u8; 32]>,
+}
+struct FlightState {
+    available: Option<PoolTokens>,
+    failed_until: Option<std::time::Instant>,
+}
+struct TokenFlight {
+    state: std::sync::Mutex<FlightState>,
+    changed: std::sync::Condvar,
+}
+impl Default for TokenFlight {
+    fn default() -> Self {
+        Self {
+            state: std::sync::Mutex::new(FlightState {
+                available: Some(PoolTokens::default()),
+                failed_until: None,
+            }),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+}
+fn token_failure() -> Error {
+    Error::Unavailable("helper token acquisition unavailable".into())
+}
+impl TokenFlight {
+    fn acquire(
+        self: &std::sync::Arc<Self>,
+        config: &Config,
+        agent: &ureq::Agent,
+        deadline: std::time::Instant,
+    ) -> Result<String> {
+        loop {
+            let mut state = recover_lock(&self.state);
+            let now = std::time::Instant::now();
+            if now >= deadline || state.failed_until.is_some_and(|until| now < until) {
+                return Err(token_failure());
+            }
+            if let Some(mut tokens) = state.available.take() {
+                drop(state);
+                let this = std::sync::Arc::clone(self);
+                let config = config.clone();
+                let agent = agent.clone();
+                let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+                std::thread::spawn(move || {
+                    // Credential reads, flock waits, grant I/O and rejection
+                    // invalidation happen outside the coordination mutex.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if tokens.last.is_some_and(|hash| rejected(&hash)) {
+                            tokens.manager.reject(&config);
+                            tokens.last = None;
+                        }
+                        for fresh in [false, true] {
+                            let value = tokens
+                                .manager
+                                .acquire(&config, fresh, |credential| {
+                                    let remaining = deadline
+                                        .saturating_duration_since(std::time::Instant::now());
+                                    if remaining.is_zero() {
+                                        return Err(token_failure());
+                                    }
+                                    fetch_token(&agent, &config, credential, remaining)
+                                })?
+                                .value()
+                                .to_owned();
+                            let hash = bearer_digest(&value);
+                            tokens.last = Some(hash);
+                            if !rejected(&hash) {
+                                return Ok(value);
+                            }
+                            tokens.manager.reject(&config);
+                            tokens.last = None;
+                        }
+                        Err(token_failure())
+                    }));
+                    let result = match result {
+                        Ok(value) => value,
+                        Err(_) => {
+                            tokens = PoolTokens::default();
+                            Err(token_failure())
+                        }
+                    };
+                    let mut state = recover_lock(&this.state);
+                    state.failed_until = result
+                        .as_ref()
+                        .err()
+                        .map(|_| std::time::Instant::now() + Duration::from_secs(1));
+                    state.available = Some(tokens);
+                    drop(state);
+                    this.changed.notify_all();
+                    let _ = sender.send(result);
+                });
+                let result = receiver
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .map_err(|_| token_failure())??;
+                // Acquisition linearizes here. In-flight sends acquired before
+                // rejection may complete, but no later acquisition returns it.
+                if !rejected(&bearer_digest(&result)) {
+                    return Ok(result);
+                }
+                continue;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next, _) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            drop(next);
+        }
+    }
+}
+
+pub struct PooledApi {
+    agent: ureq::Agent,
+    token_agent: ureq::Agent,
+    tls: std::result::Result<ureq::tls::TlsConfig, String>,
+    tokens: std::sync::Arc<TokenFlight>,
+}
+impl PooledApi {
+    pub fn new(_config: &Config) -> Result<Self> {
+        // Cache the Arc-containing config even when the first endpoint is HTTP.
+        // An invalid certificate bundle is an error only for a TLS request.
+        let tls = tls_from_env().map_err(|error| match error {
+            Error::Unavailable(message) => message,
+            _ => "TLS configuration unavailable".into(),
+        });
+        let config = agent_configuration(Some(2), tls.as_ref().ok().cloned());
+        use ureq::unversioned::transport::Connector;
+        let connector =
+            ureq::unversioned::transport::DefaultConnector::default().chain(ObserveConnector);
+        let agent = ureq::Agent::with_parts(
+            config,
+            connector,
+            ureq::unversioned::resolver::DefaultResolver::default(),
+        );
+        Ok(Self {
+            agent,
+            token_agent: agent_configuration(None, None).new_agent(),
+            tls,
+            tokens: std::sync::Arc::new(TokenFlight::default()),
+        })
+    }
+    pub fn request(
+        &self,
+        config: &Config,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        params: &[(&str, &str)],
+        timeout: Duration,
+    ) -> Result<Response> {
+        if !matches!((method, path), ("POST", "/search") | ("GET", "/preview")) {
+            return Err(Error::Usage(
+                "pooled API is limited to picker search and preview".into(),
+            ));
+        }
+        let mut url = format!("{}{}", config.endpoint, path);
+        if !params.is_empty() {
+            url.push('?');
+            url.push_str(&form(params));
+        }
+        let data = body
+            .map(encode)
+            .transpose()?
+            .unwrap_or_default()
+            .into_bytes();
+        let deadline = std::time::Instant::now() + timeout;
+        let mut auth_retry = false;
+        let mut transport_retry = false;
+        loop {
+            let bearer = if config.is_tailnet() {
+                None
+            } else {
+                Some(self.tokens.acquire(config, &self.token_agent, deadline)?)
+            };
+            // Only the body is replayed verbatim; every attempt acquires a
+            // bearer again, including expiry and single-use policy checks.
+            let response = match self.send(
+                method,
+                &url,
+                bearer.as_deref(),
+                body.is_some(),
+                &data,
+                timeout,
+            ) {
+                Ok(response) => response,
+                Err(error) => {
+                    let observed = ATTEMPT.with(std::cell::Cell::get);
+                    if !transport_retry
+                        && observed.reused
+                        && observed.disconnected
+                        && !observed.response_bytes
+                    {
+                        transport_retry = true;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            if response.status == 401 {
+                if let Some(bearer) = bearer {
+                    recover_lock(rejected_bearers()).insert(bearer_digest(&bearer));
+                    if !auth_retry {
+                        auth_retry = true;
+                        continue;
+                    }
+                }
+            }
+            return Ok(response);
+        }
+    }
+    fn send(
+        &self,
+        method: &str,
+        url: &str,
+        bearer: Option<&str>,
+        has_body: bool,
+        data: &[u8],
+        timeout: Duration,
+    ) -> Result<Response> {
+        ATTEMPT.with(|state| state.set(AttemptObservation::default()));
+        let mut request = ureq::http::Request::builder()
+            .method(method)
+            .uri(url)
+            .header("Accept", "application/json")
+            .header("User-Agent", USER_AGENT);
+        if let Some(bearer) = bearer {
+            let mut header = ureq::http::HeaderValue::from_str(&format!("Bearer {bearer}"))
+                .map_err(|_| Error::Unavailable("invalid HTTP header".into()))?;
+            header.set_sensitive(true);
+            request = request.header("Authorization", header);
+        }
+        if has_body {
+            request = request.header("Content-Type", "application/json");
+        }
+        let mut bytes = data;
+        let mut absent = ();
+        let payload = if has_body {
+            bytes.as_body()
+        } else {
+            absent.as_body()
+        };
+        let request = request
+            .body(payload)
+            .map_err(|_| Error::Unavailable("invalid HTTP request".into()))?;
+        let proxy = proxy_for_url(url, |name| std::env::var(name).ok())?;
+        let uses_tls = url.starts_with("https:")
+            || proxy
+                .as_ref()
+                .is_some_and(|p| p.protocol() == ureq::ProxyProtocol::Https);
+        let mut request = self.agent.configure_request(request).proxy(proxy);
+        if uses_tls {
+            request = request.tls_config(self.tls.clone().map_err(Error::Unavailable)?);
+        }
+        let request = request
+            .timeout_global(None)
+            .timeout_per_call(None)
+            .timeout_resolve(Some(timeout))
+            .timeout_connect(Some(timeout))
+            .timeout_send_request(Some(timeout))
+            .timeout_send_body(None)
+            .timeout_recv_response(Some(timeout))
+            .timeout_recv_body(None)
+            .timeout_per_read(Some(timeout))
+            .timeout_per_write(Some(timeout))
+            .build();
+        let mut response = self
+            .agent
+            .run(request)
+            .map_err(|_| Error::Unavailable("HTTP transport failed".into()))?;
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        const MAX_HELPER_BODY: u64 = 4 * 1024 * 1024;
+        let mut body = Vec::new();
+        response
+            .body_mut()
+            .as_reader()
+            .take(MAX_HELPER_BODY + 1)
+            .read_to_end(&mut body)
+            .map_err(|_| Error::Unavailable("HTTP response read failed".into()))?;
+        if body.len() as u64 > MAX_HELPER_BODY {
+            return Err(Error::Unavailable("helper response too large".into()));
+        }
+        Ok(Response {
+            status,
+            headers,
+            body,
+        })
+    }
+}
+
+// Observations belong to the calling thread and contain no request data. The
+// pinned transport wrapper distinguishes a reused disconnect from new socket,
+// timeout, TLS, protocol, or partial-response failures before considering retry.
+#[derive(Clone, Copy, Default)]
+struct AttemptObservation {
+    seen: bool,
+    reused: bool,
+    response_bytes: bool,
+    disconnected: bool,
+}
+thread_local! { static ATTEMPT: std::cell::Cell<AttemptObservation> = const { std::cell::Cell::new(AttemptObservation { seen:false,reused:false,response_bytes:false,disconnected:false }) }; }
+#[derive(Debug)]
+struct ObserveConnector;
+impl<T: ureq::unversioned::transport::Transport> ureq::unversioned::transport::Connector<T>
+    for ObserveConnector
+{
+    type Out = ObservedTransport<T>;
+    fn connect(
+        &self,
+        _details: &ureq::unversioned::transport::ConnectionDetails,
+        chained: Option<T>,
+    ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+        Ok(chained.map(|inner| ObservedTransport { inner, used: false }))
+    }
+}
+#[derive(Debug)]
+struct ObservedTransport<T> {
+    inner: T,
+    used: bool,
+}
+impl<T: ureq::unversioned::transport::Transport> ureq::unversioned::transport::Transport
+    for ObservedTransport<T>
+{
+    fn buffers(&mut self) -> &mut dyn ureq::unversioned::transport::Buffers {
+        self.inner.buffers()
+    }
+    fn transmit_output(
+        &mut self,
+        amount: usize,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> std::result::Result<(), ureq::Error> {
+        ATTEMPT.with(|state| {
+            let mut s = state.get();
+            if !s.seen {
+                s.seen = true;
+                s.reused = self.used;
+            }
+            state.set(s);
+        });
+        self.used = true;
+        let result = self.inner.transmit_output(amount, timeout);
+        observe_disconnect(&result);
+        result
+    }
+    fn await_input(
+        &mut self,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> std::result::Result<bool, ureq::Error> {
+        let result = self.inner.await_input(timeout);
+        ATTEMPT.with(|state| {
+            let mut s = state.get();
+            if matches!(result, Ok(false)) {
+                s.disconnected = true;
+            }
+            if !self.inner.buffers().input().is_empty() {
+                s.response_bytes = true;
+            }
+            state.set(s);
+        });
+        observe_disconnect(&result);
+        result
+    }
+    fn is_open(&mut self) -> bool {
+        self.inner.is_open()
+    }
+    fn is_tls(&self) -> bool {
+        self.inner.is_tls()
+    }
+}
+fn observe_disconnect<T>(result: &std::result::Result<T, ureq::Error>) {
+    if matches!(result,Err(ureq::Error::Io(e)) if matches!(e.kind(),std::io::ErrorKind::BrokenPipe|std::io::ErrorKind::ConnectionReset|std::io::ErrorKind::ConnectionAborted|std::io::ErrorKind::UnexpectedEof))
+    {
+        ATTEMPT.with(|state| {
+            let mut s = state.get();
+            s.disconnected = true;
+            state.set(s);
+        });
+    }
+}
+
+#[cfg(test)]
+mod pooled_lock_tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_coordination_preserves_available_manager_and_rejections() {
+        let flight = TokenFlight::default();
+        let hash = bearer_digest("synthetic-poison-registry-entry");
+        let _ = std::panic::catch_unwind(|| {
+            let mut state = flight.state.lock().unwrap();
+            state.failed_until = None;
+            panic!("synthetic coordination panic");
+        });
+        let _ = std::panic::catch_unwind(|| {
+            let mut rejected = rejected_bearers().lock().unwrap();
+            rejected.insert(hash);
+            panic!("synthetic rejection-registry panic");
+        });
+        assert!(recover_lock(&flight.state).available.is_some());
+        assert!(rejected(&hash));
+        // A subsequent waiter can reserve the manager and complete its handoff.
+        let manager = recover_lock(&flight.state).available.take().unwrap();
+        recover_lock(&flight.state).available = Some(manager);
+        assert!(recover_lock(&flight.state).available.is_some());
+    }
 }
 
 #[cfg(test)]
