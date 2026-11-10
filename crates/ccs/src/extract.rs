@@ -124,6 +124,20 @@ pub fn loads_strict(s: &str) -> Result<Value> {
         .ok_or_else(|| util::invalid("JSON nesting cannot be materialized"))
 }
 
+// Local readers deliberately materialize beyond Python's recursion limit (D10).
+// Release consumed records iteratively, including on skipped-record paths, so
+// a worker thread's smaller stack does not change that reading behavior.
+fn discard_record(value: Value) {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Array(values) => pending.extend(values),
+            Value::Object(fields) => pending.extend(fields.into_iter().map(|(_, value)| value)),
+            _ => {}
+        }
+    }
+}
+
 pub struct Records {
     reader: Option<BufReader<fs::File>>,
     index: Option<session_codex::IndexState>,
@@ -173,10 +187,12 @@ impl Iterator for Records {
                 continue;
             };
             if !matches!(rec, Value::Object(_)) {
+                discard_record(rec);
                 continue;
             }
             if let Some(index) = self.index.as_mut() {
                 if !index.accept(&rec) {
+                    discard_record(rec);
                     continue;
                 }
                 let normal = match session_codex::normalize_with_context(
@@ -187,11 +203,13 @@ impl Iterator for Records {
                 ) {
                     Ok(normal) => normal,
                     Err(error) => {
+                        discard_record(rec);
                         self.failure = Some(error);
                         self.reader = None;
                         return None;
                     }
                 };
+                discard_record(rec);
                 rec = normal;
                 self.entrypoint = get(&rec, "entrypoint").clone();
                 if util::truthy(get(&rec, "cwd")) {
@@ -407,6 +425,7 @@ fn scan_records(
         }
         let content = record_text_points(&rec);
         if content.is_empty() {
+            discard_record(rec);
             continue;
         }
         if first.is_none() && is(get(&rec, "type"), "user") {
@@ -425,6 +444,7 @@ fn scan_records(
         if s.source.last_texts.len() > keep_last {
             s.source.last_texts.pop_front();
         }
+        discard_record(rec);
     }
     let title = titles
         .into_iter()

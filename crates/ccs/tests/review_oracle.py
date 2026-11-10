@@ -210,5 +210,24 @@ with tempfile.TemporaryDirectory(prefix='ccs-review-') as home:
     run_requests([{'op': 'log', 'input': 'first\nsecond'}])
     assert log.read_text().endswith(' WARN first second\n') and len(log.read_text().splitlines()) == 1
     count += 3
+    # D10 permits local reading beyond Python's recursion limit. Derive the
+    # expected searchable fields from an otherwise identical shallow record.
+    deep = project / 'dddddddd-dddd-dddd-dddd-dddddddddddd.jsonl'
+    record = user('deep-token', cwd='/work', entrypoint='cli', unknown=0)
+    write(deep, [record])
+    expected = json.loads(json.dumps(snapshot(extract.scan(str(deep), 'deep-token'))))
+    stamp = deep.stat()
+    raw = json.dumps(record).replace('"unknown": 0', '"unknown": ' + '[' * 20000 + '0' + ']' * 20000)
+    deep.write_text(raw + '\n')
+    os.utime(deep, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+    try:
+        extract.scan(str(deep), 'deep-token')
+    except RecursionError:
+        pass
+    else:
+        raise AssertionError('D10 reference no longer raises RecursionError at depth 20000')
+    count += check([('D10-local-depth-20000', {'op': 'scan', 'input': str(deep), 'query': 'deep-token'}, expected)])
+    count += check([('D10-parallel-search-depth-20000', {'op': 'search', 'input': {'query': 'deep-token'}}, [expected])])
 assert failure_count == 0, '%d differential cases failed' % failure_count
+print('PASS D10: Python raises RecursionError at depth 20000; Rust returns the shallow-equivalent local search result')
 print('PASS local review oracle: %d cases; real rollouts, timestamp quirks, saved state, metadata, path filtering and logs' % count)
