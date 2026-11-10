@@ -171,6 +171,26 @@ with tempfile.TemporaryDirectory(prefix='ccs-review-') as home:
     add('mtime-stable-ties', {'op': 'newest', 'input': ties}, fallback._newest(ties, None))
     for path, root in [(project / 'missing', project), (project / 'missing/../present', project), (project, project), (project, Path('/')), (project / 'missing/child', project / 'missing')]:
         add('non-strict-realpath', {'op': 'is_within', 'input': str(path), 'root': str(root)}, util.is_within(str(path), str(root)))
+    regular = project / 'regular.txt'
+    regular.touch()
+    alias = project / 'alias.txt'
+    alias.symlink_to(regular)
+    outside = Path(home) / 'outside.txt'
+    outside.touch()
+    escaped = project / 'escaped.txt'
+    escaped.symlink_to(outside)
+    fifo = project / 'fifo'
+    os.mkfifo(fifo)
+    for path in [regular, alias, outside, escaped, fifo, project, project / 'missing.txt']:
+        try:
+            fd = util.open_regular(str(path), str(project))
+            os.close(fd)
+            expected = 'regular'
+        except util.UnsafePath:
+            expected = 'unsafe'
+        except OSError as error:
+            expected = 'io:%d' % error.errno
+        add('open-error-type', {'op': 'open_regular', 'input': str(path), 'root': str(project)}, expected)
     count += check(cases)
     # D5 only warns for a relevant transcript, including one below a byte path.
     log = Path(util.log_path())

@@ -73,6 +73,23 @@ pub fn number(n: impl ToString) -> Value {
 pub fn invalid(message: &str) -> Error {
     Error::Io(io::Error::new(io::ErrorKind::InvalidData, message))
 }
+/// A refused filesystem object, distinct from an ordinary OS read failure.
+/// Kept inside Error::Io so consumers can retain the shared error enum.
+#[derive(Debug)]
+pub struct UnsafePath(pub String);
+impl std::fmt::Display for UnsafePath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for UnsafePath {}
+fn unsafe_path(message: &str) -> Error {
+    Error::Io(io::Error::other(UnsafePath(message.into())))
+}
+/// Call before handling plain Error::Io when unsafe objects need a warning.
+pub fn is_unsafe_path(error: &Error) -> bool {
+    matches!(error, Error::Io(error) if error.get_ref().is_some_and(|source| source.is::<UnsafePath>()))
+}
 pub fn parse_json(s: &str) -> Result<Value> {
     let p = json::parse_bounded(&s.chars().map(u32::from).collect::<Vec<_>>(), usize::MAX)
         .map_err(|_| invalid("invalid JSON"))?;
@@ -256,25 +273,31 @@ pub fn is_within(path: &Path, root: &Path) -> bool {
 }
 pub fn open_regular(path: &Path, root: Option<&Path>) -> Result<File> {
     if root.is_some_and(|r| !is_within(path, r)) {
-        return Err(invalid("path resolves outside its root"));
+        return Err(unsafe_path("path resolves outside its root"));
     }
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-        .map_err(Error::Io)?;
+        .map_err(|error| {
+            if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::EMLINK)) {
+                unsafe_path("path is a symlink")
+            } else {
+                Error::Io(error)
+            }
+        })?;
     let st = file.metadata().map_err(Error::Io)?;
     if !st.is_file() {
-        return Err(invalid("path is not a regular file"));
+        return Err(unsafe_path("path is not a regular file"));
     }
     if let Some(root) = root {
         let resolved = fs::canonicalize(path).map_err(Error::Io)?;
         if !is_within(&resolved, root) {
-            return Err(invalid("path changed while opening"));
+            return Err(unsafe_path("path changed while opening"));
         }
         let rst = fs::metadata(resolved).map_err(Error::Io)?;
         if (st.dev(), st.ino()) != (rst.dev(), rst.ino()) {
-            return Err(invalid("path changed while opening"));
+            return Err(unsafe_path("path changed while opening"));
         }
     }
     use std::os::fd::AsRawFd;
@@ -756,14 +779,25 @@ mod tests {
         assert_eq!(fs::read_to_string(&p).unwrap(), "second");
         let link = root.join("alias");
         symlink(&p, &link).unwrap();
-        assert!(open_regular(&link, Some(&root)).is_err());
-        assert!(open_regular(&nested, Some(&root)).is_err());
-        assert!(open_regular(&p, Some(&nested.join("wrong"))).is_err());
+        assert!(is_unsafe_path(
+            &open_regular(&link, Some(&root)).unwrap_err()
+        ));
+        assert!(is_unsafe_path(
+            &open_regular(&nested, Some(&root)).unwrap_err()
+        ));
+        assert!(is_unsafe_path(
+            &open_regular(&p, Some(&nested.join("wrong"))).unwrap_err()
+        ));
+        let missing = open_regular(&root.join("missing"), Some(&root)).unwrap_err();
+        assert!(!is_unsafe_path(&missing));
+        assert!(matches!(missing, Error::Io(e) if e.kind() == io::ErrorKind::NotFound));
         let fifo = root.join("fifo");
         let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: name is a valid NUL-terminated path in our disposable directory.
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-        assert!(open_regular(&fifo, Some(&root)).is_err());
+        assert!(is_unsafe_path(
+            &open_regular(&fifo, Some(&root)).unwrap_err()
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 }

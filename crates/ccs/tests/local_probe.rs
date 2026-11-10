@@ -52,6 +52,20 @@ fn call(v: &Value) -> ccs::errors::Result<Value> {
             ("home", string(home().to_string_lossy())),
             ("short", string(short_cwd(&text(input).unwrap(), 80))),
         ])),
+        "open_regular" => {
+            let path = text(input).unwrap();
+            let root = text(get(v, "root"));
+            Ok(string(
+                match open_regular(Path::new(&path), root.as_deref().map(Path::new)) {
+                    Ok(_) => "regular".to_owned(),
+                    Err(ref error) if is_unsafe_path(error) => "unsafe".to_owned(),
+                    Err(ccs::errors::Error::Io(e)) => {
+                        format!("io:{}", e.raw_os_error().unwrap_or(0))
+                    }
+                    Err(e) => panic!("unexpected open error: {e:?}"),
+                },
+            ))
+        }
         "is_within" => Ok(Value::Bool(is_within(
             Path::new(&text(input).unwrap()),
             Path::new(&text(get(v, "root")).unwrap()),
