@@ -403,6 +403,21 @@ fn archive(api: &mut Api, key: &str, codex: bool) -> Result<Response> {
     Ok(response)
 }
 fn extract_tool_results(bytes: &[u8], dest: &Path) -> Result<()> {
+    // D11: recognize unsupported streams before creating or modifying dest.
+    // The block/end marker distinguishes bzip2 from a plain tar whose first
+    // member has a valid name such as BZh9report.txt.
+    let bzip2 = bytes.starts_with(b"BZh")
+        && matches!(bytes.get(3), Some(b'1'..=b'9'))
+        && bytes
+            .get(4..10)
+            .is_some_and(|magic| magic == b"1AY&SY" || magic == b"\x17rE8P\x90");
+    let xz = bytes.starts_with(b"\xfd7zXZ\0");
+    if bzip2 || xz {
+        let kind = if bzip2 { "bzip2" } else { "xz" };
+        return Err(refused(format!(
+            "refusing tool-results archive: unsupported {kind} compression (only uncompressed and gzip are supported)"
+        )));
+    }
     util::ensure_dir(dest, 0o700)?;
     let input: Box<dyn Read + '_> = if bytes.starts_with(&[0x1f, 0x8b]) {
         Box::new(flate2::read::MultiGzDecoder::new(bytes))

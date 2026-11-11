@@ -7,10 +7,12 @@ The fake agents replace the process and deliberately return 17. No real services
 credentials or agent binaries are used. Pass --evidence to retain both observations.
 """
 import argparse
+import bz2
 import gzip
 import hashlib
 import io
 import json
+import lzma
 import os
 from pathlib import Path
 import pty
@@ -75,11 +77,21 @@ def tar(members):
     return buf.getvalue()
 
 
-# (name, expected status). The fixture function defines each independent input.
+# D11 rejects these formats before touching the tool-results destination.
+D11_CASES = {
+    'restore-bzip2-tools': 'bzip2',
+    'restore-xz-tools': 'xz',
+    'restore-bzip2-existing-tools': 'bzip2',
+    'restore-xz-existing-tools': 'xz',
+}
+
+# (name, expected Python status). The fixture defines each independent input.
 CASES = [(n, code) for n, code in [
     ('restore', 17), ('restore-closed-stderr', 1), ('restore-print', 0), ('restore-fork', 17),
     ('restore-utf8-replace', 17), ('restore-bad-project', 17),
     ('restore-gzip-tools', 17), ('restore-no-tools', 17), ('restore-empty-tools', 17),
+    ('restore-bzip-prefix-tools', 17),
+    *[(name, 17) for name in D11_CASES],
     ('restore-tool-mode', 17), ('restore-missing-to', 4), ('restore-print-needs-to', 4),
     ('restore-invalid-to', 4), ('restore-tilde-to', 17), ('restore-relative-to', 17),
     ('restore-username-to', 17), ('restore-symlink-to', 17), ('restore-sha', 4), ('restore-sha-missing', 4),
@@ -215,6 +227,10 @@ def fixture(root, name, base):
         if name == 'restore-utf8-replace': body += b'\xff\xed\xa0\x80\n'
         if name == 'restore-bad-project': meta['project_dir'] = '../../escape'
         if name == 'restore-gzip-tools': tools = gzip.compress(tools)
+        if name == 'restore-bzip-prefix-tools': tools = tar([('BZh9report.txt', tarfile.REGTYPE, b'plain tar', 0o644)])
+        if name in D11_CASES:
+            tools = (bz2.compress if D11_CASES[name] == 'bzip2' else lzma.compress)(tools)
+            if 'existing' in name: write(tr / 'out.txt', 'keep existing output')
         if name == 'restore-no-tools': tool_status = 404
         if name == 'restore-empty-tools': tools = b''
         if name == 'restore-tool-mode': tools = tar([('out.txt', tarfile.REGTYPE, b'tool', 0o6777), ('user.txt', tarfile.REGTYPE, b'u', 0o0055)])
@@ -370,6 +386,10 @@ def compare(probe, cases, evidence=None):
                     if root.exists(): shutil.rmtree(root)
                     root.mkdir()
                     req, env, home, response, answers = fixture(root, name, server.base)
+                    if name in D11_CASES:
+                        before = snapshot(home)
+                        destination = home / '.claude/projects' / encoded(home / "work space's" / '日本') / SID / 'tool-results'
+                        destination_existed = destination.exists()
                     arg = json.dumps(req)
                     command = [sys.executable, '-c', PYTHON, str(REPO), arg] if engine == 'python' else [str(probe), arg]
                     server.requests.clear()
@@ -380,9 +400,13 @@ def compare(probe, cases, evidence=None):
                                     stderr=result.stderr.decode('utf-8', 'replace'), files=snapshot(home),
                                     http=[{k:r[k] for k in ('method','path','query','raw')} for r in server.requests])
                     for r in observed['http']: r['raw'] = r['raw'].hex()
+                    if name in D11_CASES:
+                        observed.update(initial_files=before, destination_existed=destination_existed,
+                                        destination_exists=destination.exists())
                     pair.append(observed)
                 python, rust = pair
                 deviation = ''
+                checks = {}
                 check_python, check_rust = dict(python), dict(rust)
                 if expected_code == 1 and name != 'local-deep-line':
                     # D6 changes diagnostics only. Status, side effects and requests still match.
@@ -395,16 +419,31 @@ def compare(probe, cases, evidence=None):
                     passed = python['exit'] == 17 and rust['exit'] == 4 and 'exec.json' not in rust['files']
                     if name == 'remote-newline-id': passed &= len(rust['http']) == 1
                     else: passed &= not any(p.endswith('.jsonl') for p in rust['files'])
+                elif name in D11_CASES:
+                    deviation = 'D11'
+                    reason = ('ccs: refusing tool-results archive: unsupported %s compression '
+                              '(only uncompressed and gzip are supported)\n' % D11_CASES[name])
+                    extracted = [v for p, v in python['files'].items() if p.endswith('/tool-results/out.txt')]
+                    checks = dict(
+                        python_extract=(python['exit'] == 17 and len(extracted) == 1
+                                        and extracted[0]['bytes'] == b'tool contents\n'.hex()),
+                        exit_4=rust['exit'] == 4, empty_stdout=rust['stdout'] == '',
+                        one_line_reason=rust['stderr'] == reason,
+                        http_requests=rust['http'] == python['http'],
+                        no_writes=rust['files'] == rust['initial_files'],
+                        destination_unchanged=rust['destination_exists'] == rust['destination_existed'])
+                    passed = all(checks.values())
                 elif name == 'local-deep-line':
                     deviation = 'D10'
                     passed = python['exit'] == 1 and 'RecursionError' in python['stderr'] and rust['exit'] == 17
                 else:
                     passed = python['exit'] == expected_code and check_python == check_rust
-                observation = dict(case=name, pass_=passed, deviation=deviation, python=python, rust=rust)
+                observation = dict(case=name, pass_=passed, deviation=deviation, checks=checks, python=python, rust=rust)
                 observations.append(observation)
                 if not passed:
                     failures.append(name)
                     print('FAIL', name, 'expected', expected_code, 'exit', python['exit'], rust['exit'])
+                    if checks: print('  failed checks:', [key for key, ok in checks.items() if not ok])
                     for key in check_python:
                         if check_python[key] != check_rust[key]:
                             if key == 'files':
