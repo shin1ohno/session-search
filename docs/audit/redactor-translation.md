@@ -26,7 +26,7 @@ generators under `tests/conformance/`. Everything ran with CPython 3.13.5
 | Line route | No difference on 200,014 raw lines, including invalid UTF-8, after applying D2/D3. |
 | Pass limit | No difference on 25,000 inputs whose Python loop runs 0 to 8 passes; for 3,694 of them the last pass's result is returned without a fixed point, as the contract requires. |
 | Equivalence predicates | `subsumed-optional` is unsound in general (finding F2). It is sound for its only r1 use. |
-| Gates | All conformance gates run in the required checks. The committed corpus alone does not detect four count/strip slips; the second-layer gates do (observation O1). |
+| Gates | All conformance gates run in the required checks. The committed corpus alone does not detect four count/strip slips; the second-layer gates do (observation O1). Of seven audit-built Rust mutants, six fail some gate; one, an HMAC key truncated to 32 bytes, passes every gate (finding F3). |
 
 No input was found where Rust masks less than Python, or where Rust and Python
 differ at all, on the shipped ruleset. Both findings are latent: they make the
@@ -221,7 +221,9 @@ applies the predicates only to mutants that some input already killed.
 
 r1 is not affected: the predicate's shape occurs only in `openai-key`
 (`(?:proj-)?[A-Za-z0-9_-]{20,}`), where the following repeat is greedy and ends
-the pattern, so its use there is sound.
+the pattern, so its use there is sound. In the audit's run of the full gate
+sequence, 47 survivors were classified, and all 7 classified as
+`subsumed-optional` were `openai-key` mutants.
 
 ## 7. Gates
 
@@ -257,11 +259,42 @@ non-ASCII values that Python keeps, so it over-masks rather than leaks. The
 audit's own text/record differential also found it (66 differences in 30,000
 cases).
 
+**Further Rust mutants.** Six more single-change mutants were built for
+behaviours that have no repository negative control, and run through the same
+gates. Two failed the corpus: the `config-secret` value of a secret-named key
+not charged to the record budget (2 vectors), and duplicate JSON keys keeping
+the first value instead of the last (1 vector). The other four passed the
+corpus:
+
+| Mutant | Gate that failed | Differences |
+|---|---|---|
+| `xxx` placeholder test made case-sensitive (`lib.rs:229-234`) | `differential` | 14,952 and 375 key-order |
+| secret-named-key test applied to the masked key instead of the original (`lib.rs:389`) | `differential` | 2 and 2 key-order |
+| writer escapes `\x7f` in non-ASCII output (`json.rs:530-565`) | `lines` | 88 |
+| HMAC key truncated to 32 bytes (`lib.rs:244-248`) | none | 0 (finding F3) |
+
+The second of these masks less than Python, and Python's detector does not flag
+its output, because the masked key no longer names a secret; the CI seed catches
+it through 2 exact-output differences in 332,720 cases. The audit's own
+comparisons detected all four (46, 2 and 163 differences, and a failed run of
+the audit key corpus).
+
+**Finding F3 (gap in the gates): no gate uses an HMAC key longer than 32
+bytes.** The tag is an HMAC of the matched secret under the deployment's key,
+and a translation that mishandled long keys would ship wrong tags. The corpus
+uses only keys of 11 and 21 bytes, and the generated differential and the
+request protocol use one fixed 21-byte key (`crates/ccs/src/conformance.rs:157`),
+so a mutant that truncates the key to 32 bytes passed every gate listed above.
+Wrong tags do not leak secrets, and the server does not check them, so it would
+not stop them either. The current code is not affected: it matched Python on
+keys of 1 to 768 bytes (section 1).
+
 ## Not covered
 
-- Rust mutants were built for one behaviour only (above). The remaining gate
-  sensitivity is taken from the repository's own negative controls, whose
-  latest run passed, and from the Python-side corpus analysis.
+- Rust mutants were built for the seven behaviours above. The rest of the gate
+  sensitivity is taken from the repository's own negative controls, which
+  passed again in an audit run of the full gate sequence, and from the
+  Python-side corpus analysis.
 - The weekly extended differential (2 million inputs with a per-run seed) was
   not repeated.
 - Like the gates, every check here is finite. None shows equivalence on all
