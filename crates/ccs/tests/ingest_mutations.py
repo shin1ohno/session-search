@@ -10,6 +10,7 @@ import tempfile
 REPO = Path(__file__).resolve().parents[3]
 # Each mutation changes production code, not the oracle or a fake API result.
 MUTATIONS = [
+    ('canonical-request-path', 'review_paths', 'string(codex::absolute(Path::new(path)).to_string_lossy())', 'string(path)'),
     ('tombstone-ascii', 'statuses', 'json::dumps_compact(value, true, false)', 'json::dumps_compact(value, false, false)'),
     ('kinds-iterable', 'statuses', 'let kinds = match kinds {', 'let kinds = match kinds { Value::String(_) => return Err(util::invalid("not iterable")),'),
     ('numeric-version', 'diff', 'crate::config::number(get(&data, "version")) == Some(1.0)', 'integer(get(&data, "version")) == Some(1)'),
@@ -18,7 +19,7 @@ MUTATIONS = [
     ('cursor', 'basics', 'set(entry, "offset", next);', 'set(entry, "offset", number(999999));'),
     ('dev-reset', 'diff', 'integer(get(&entry, "dev")) != Some(st.dev())', 'false'),
     ('inode-reset', 'diff', 'integer(get(&entry, "inode")) != Some(st.ino())', 'false'),
-    ('truncate-reset', 'diff', 'st.len() < integer(get(&entry, "offset")).unwrap_or(0)', 'false'),
+    ('truncate-reset', 'diff', 'offset_cmp(&stored_offset, st.len())?.is_gt()', 'false'),
     ('unknown-state', 'diff', 'let mut entry = get(self.state.files(), path).clone();', 'let mut entry = get(self.state.files(), path).clone(); remove(&mut entry, "unknown");'),
     ('segment-cap', 'segments', 'const MAX_SEGMENT: usize = 4 * 1024 * 1024;', 'const MAX_SEGMENT: usize = 8 * 1024 * 1024;'),
     ('oversize', 'segments', 'data.len() > MAX_SEGMENT', 'data.len() > 2 * MAX_SEGMENT'),
@@ -33,6 +34,22 @@ MUTATIONS = [
     ('codex-capability', 'codex', 'if self.codex_ready == Some(false) {\n                return Ok(());', 'if false {\n                return Ok(());'),
     ('surrogate-offset', 'surrogates', '.mask_line(raw, position, &self.key)', '.mask_line(raw, position + 1, &self.key)'),
     ('depth-route', 'deviations', 'lines.push(output);', 'lines.push(output.replace("too-deep", "wrong-reason"));'),
+    ('MA-blob-cap', 'review_blobs', '.redact_text(&String::from_utf8_lossy(&raw), &self.key)', '.redact_text_capped(&String::from_utf8_lossy(&raw), &self.key, usize::MAX)'),
+    ('MB-blob-generation', 'review_blobs', 'remove(&mut entry, "blobs");', ''),
+    ('MC-budget-expiry', 'review_budgets', 'self.deadline.is_some_and(|d| Instant::now() > d)', 'false'),
+    ('MD-file-budget', 'review_budgets', 'Some(20)', 'Some(200)'),
+    ('MD-sweep-budget', 'review_budgets', 'Some(120)', 'Some(1200)'),
+    ('ME-subagent-symlink', 'review_symlink', 'if sub.is_symlink() || !sub.is_dir() {', 'if !sub.is_dir() {'),
+    ('MF-state-files', 'review_blobs', '!matches!(get(&data, "files"), Value::Object(_))', 'false'),
+    ('MG-segment-checkpoint', 'review_checkpoint', 'set(self.state.files_mut(), path, entry.clone());\n            self.state.save()?;', 'set(self.state.files_mut(), path, entry.clone());'),
+    ('response-integer-range', 'review_numbers', "python_integer(value).is_some_and(|s| !s.starts_with('-'))", 'integer(value).is_some()'),
+    ('generation-coercion', 'review_numbers', 'fn increment_generation(value: &Value) -> Result<Value> {', "fn increment_generation(value: &Value) -> Result<Value> { if let Value::Number(n) = value { if n.contains('.') { return Ok(number(1)); } }"),
+    ('response-materialization', 'review_responses', 'util::parse_json(s).ok()', 'json::from_str(s).ok()'),
+    ('relative-subagent-key', 'review_paths', 'subagent_files(&path.with_extension(""))', 'subagent_files(&codex::absolute(path).with_extension(""))'),
+    ('non-utf8-warning', 'review_names', 'if path.to_str().is_some() {', 'if true {'),
+    ('malformed-blob-state', 'review_blobs', 'if !matches!(sent, Value::Object(_)) {', 'if false {'),
+    ('surrogate-warning', 'review_warnings', 'output.contains("\\"reason\\":\\"surrogate\\"")', 'false'),
+    ('422-warning', 'review_warnings', 'lines={} kinds={} -> tombstoned', 'indexes={} categories={} -> tombstoned'),
 ]
 
 
@@ -73,6 +90,26 @@ def main():
             if old:
                 assert run.returncode != 0 and b'AssertionError' in output, (name, 'oracle did not reject the defect', output[-1500:])
                 assert b'TimeoutExpired' not in output and b'FileNotFoundError' not in output, (name, 'environment failure')
+                reasons = {
+                    'MA-blob-cap': b'MA-blob-value-cap',
+                    'MB-blob-generation': b'MB-rotation-resends-unchanged-blob',
+                    'MC-budget-expiry': b'MC-MD-budget-file',
+                    'MD-file-budget': b'MC-MD-budget-file',
+                    'MD-sweep-budget': b'MC-MD-budget-sweep',
+                    'ME-subagent-symlink': b'ME-symlinked-subagents',
+                    'MF-state-files': b'Rust panic while processing state',
+                    'MG-segment-checkpoint': b'MG acknowledged cursor not checkpointed',
+                    'generation-coercion': b'generation-coercion-2.5',
+                    'response-integer-range': b'huge-next',
+                    'response-materialization': b'deep-success-response',
+                    'relative-subagent-key': b'relative-file-subagent-state',
+                    'non-utf8-warning': b'non-UTF8 name needs exactly one WARN',
+                    'malformed-blob-state': b'malformed-blob-state-[1]',
+                    'surrogate-warning': b'surrogate-warning',
+                    '422-warning': b'422-warning-detail',
+                    'canonical-request-path': b'path-home-sweep/.',
+                }
+                assert reasons.get(name, b'AssertionError') in output, (name, 'failed for the wrong reason', output[-2000:])
                 print('PASS negative control', name, 'rejected by', case, flush=True)
             else:
                 assert run.returncode == 0, ('positive control failed', output[-2000:])

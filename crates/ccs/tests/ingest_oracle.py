@@ -123,10 +123,15 @@ class Fixture:
         self.server.requests.clear()
         self.server.handler = handler
         previous = {e.get("last_ok") for e in json.loads(self.state.read_text()).get("files", {}).values()} if self.state.exists() and isinstance(json.loads(self.state.read_text()).get("files"), dict) else set()
+        log_path = self.home / '.claude/session-search.log'
+        if log_path.exists(): log_path.write_text('')
         started = time.time()
         result = subprocess.run(command, env=env or self.env, cwd=self.home,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 preexec_fn=(lambda: os.close(2)) if closed_stderr else None, timeout=40)
+        assert result.returncode != 101, 'Rust panic while processing state'
+        if result.returncode == 1 and not closed_stderr:
+            assert len(result.stderr.splitlines()) == 1, 'D6 internal error requires exactly one diagnostic line'
         state = self.normalized_state(started, time.time(), previous)
         requests = []
         for req in self.server.requests:
@@ -142,7 +147,8 @@ class Fixture:
                 seg = req["body"]["segment"]
                 assert seg["sha256"] == hashlib.sha256(("\n".join(seg["lines"]) + "\n").encode()).hexdigest(), "segment digest"
             requests.append((req["method"], req["path"], relevant, body))
-        return {"exit": result.returncode, "stdout": result.stdout, "state": state, "requests": requests}
+        warnings = [line.split(' WARN ', 1)[1] for line in log_path.read_text().splitlines() if ' WARN ' in line and ('surrogate at offset' in line or ' 422 at offset ' in line or 'non-UTF-8 name skipped' in line)] if log_path.exists() else []
+        return {"exit": result.returncode, "stdout": result.stdout, "state": state, "requests": requests, "warnings": warnings}
 
     def pair(self, label, args=None, factory=lambda: ok, env=None, closed_stderr=False):
         args = args or ["file", str(self.path)]
@@ -434,6 +440,8 @@ def suite(binary, selected=None):
         f.path.write_bytes(b'[' * 80 + b'0' + b']' * 79 + b' invalid\n')
         f.pair('deep-invalid-json-text-route')
     run('deviations', deviations)
+    from ingest_review_oracle import review_cases
+    review_cases(run, record_comparison, LINE, SID, SID2, scripted)
 
 
 def main():

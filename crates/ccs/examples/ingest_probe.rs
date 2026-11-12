@@ -14,6 +14,10 @@ fn main() {
         with_subagents: options.iter().any(|s| s == "--with-subagents"),
         quiet: options.iter().any(|s| s == "--quiet"),
     })
-    .unwrap_or_else(|error| error.exit_status());
+    .unwrap_or_else(|error| {
+        use std::io::Write;
+        let _ = std::io::stderr().write(b"ccs: ingest failed\n");
+        error.exit_status()
+    });
     std::process::exit(i32::from(status.code()));
 }

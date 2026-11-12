@@ -53,12 +53,217 @@ fn remove(value: &mut Value, key: &str) {
         items.retain(|(k, _)| !k.iter().copied().eq(key.chars().map(u32::from)));
     }
 }
-fn integer(value: &Value) -> Option<u64> {
+// Retain arbitrary JSON integers for the protocol; narrow only for local I/O.
+fn python_integer(value: &Value) -> Option<String> {
     match value {
-        Value::Number(s) => s.parse().ok(),
-        Value::Bool(b) => Some(u64::from(*b)),
+        Value::Bool(b) => Some(u8::from(*b).to_string()),
+        Value::Number(s) => decimal_integer(s),
         _ => None,
     }
+}
+fn decimal_integer(s: &str) -> Option<String> {
+    let digits = s
+        .strip_prefix('-')
+        .or_else(|| s.strip_prefix('+'))
+        .unwrap_or(s);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let digits = digits.trim_start_matches('0');
+    Some(if digits.is_empty() {
+        "0".into()
+    } else if s.starts_with('-') {
+        format!("-{digits}")
+    } else {
+        digits.into()
+    })
+}
+fn integer(value: &Value) -> Option<u64> {
+    python_integer(value)?.parse().ok()
+}
+fn nonnegative_integer(value: &Value) -> bool {
+    python_integer(value).is_some_and(|s| !s.starts_with('-'))
+}
+fn offset_cmp(value: &Value, size: u64) -> Result<std::cmp::Ordering> {
+    if let Some(n) = python_integer(value) {
+        if n.starts_with('-') {
+            return Ok(std::cmp::Ordering::Less);
+        }
+        let size = size.to_string();
+        return Ok(n.len().cmp(&size.len()).then_with(|| n.cmp(&size)));
+    }
+    if let Value::Number(n) = value {
+        if let Ok(n) = n.parse::<f64>() {
+            return Ok(n
+                .partial_cmp(&(size as f64))
+                .unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+    Err(util::invalid("invalid state offset"))
+}
+fn increment_generation(value: &Value) -> Result<Value> {
+    let n = if let Some(n) = python_integer(value) {
+        n
+    } else {
+        match value {
+            Value::Number(s) => {
+                let f = s
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|f| f.is_finite())
+                    .ok_or_else(|| util::invalid("invalid state generation"))?;
+                decimal_integer(&format!("{:.0}", f.trunc()))
+                    .ok_or_else(|| util::invalid("invalid state generation"))?
+            }
+            Value::String(points) => {
+                let s =
+                    json::scalar(points).map_err(|_| util::invalid("invalid state generation"))?;
+                let s = ccs_pytext::strip(&s);
+                let digits = regex::Regex::new(r"\A\p{Nd}\z").expect("decimal digit pattern");
+                let mut ascii = String::new();
+                for (i, c) in s.chars().enumerate() {
+                    if c == '_' || (i == 0 && matches!(c, '+' | '-')) {
+                        ascii.push(c);
+                    } else if digits.is_match(&c.to_string()) {
+                        let mut base = c as u32;
+                        while base > 0
+                            && char::from_u32(base - 1)
+                                .is_some_and(|p| digits.is_match(&p.to_string()))
+                        {
+                            base -= 1;
+                        }
+                        ascii.push(char::from(b'0' + ((c as u32 - base) % 10) as u8));
+                    } else {
+                        return Err(util::invalid("invalid state generation"));
+                    }
+                }
+                let bytes = ascii.as_bytes();
+                if bytes.iter().enumerate().any(|(i, b)| {
+                    *b == b'_'
+                        && (i == 0
+                            || i + 1 == bytes.len()
+                            || !bytes[i - 1].is_ascii_digit()
+                            || !bytes[i + 1].is_ascii_digit())
+                }) {
+                    return Err(util::invalid("invalid state generation"));
+                }
+                decimal_integer(&ascii.replace('_', ""))
+                    .ok_or_else(|| util::invalid("invalid state generation"))?
+            }
+            _ => return Err(util::invalid("invalid state generation")),
+        }
+    };
+    let negative = n.starts_with('-');
+    let mut digits = n.trim_start_matches('-').as_bytes().to_vec();
+    for d in digits.iter_mut().rev() {
+        if negative {
+            if *d == b'0' {
+                *d = b'9';
+            } else {
+                *d -= 1;
+                break;
+            }
+        } else if *d == b'9' {
+            *d = b'0';
+        } else {
+            *d += 1;
+            return Ok(number(String::from_utf8(digits).unwrap()));
+        }
+    }
+    if !negative {
+        digits.insert(0, b'1');
+    }
+    let value = format!(
+        "{}{}",
+        if negative { "-" } else { "" },
+        String::from_utf8(digits).unwrap()
+    );
+    Ok(number(decimal_integer(&value).unwrap()))
+}
+fn response_json(body: &[u8]) -> Value {
+    std::str::from_utf8(body)
+        .ok()
+        .and_then(|s| util::parse_json(s).ok())
+        .unwrap_or(Value::Null)
+}
+fn python_str(value: &Value) -> Result<String> {
+    Ok(match value {
+        Value::String(_) => text(value).ok_or_else(|| util::invalid("invalid log text"))?,
+        Value::Bool(b) => if *b { "True" } else { "False" }.into(),
+        Value::Null => "None".into(),
+        Value::Number(_) => match compact(value)?.as_str() {
+            "NaN" => "nan".into(),
+            "Infinity" => "inf".into(),
+            "-Infinity" => "-inf".into(),
+            n => n.into(),
+        },
+        Value::Array(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(python_repr)
+                .collect::<Result<Vec<_>>>()?
+                .join(", ")
+        ),
+        Value::Object(items) => format!(
+            "{{{}}}",
+            items
+                .iter()
+                .map(|(k, v)| Ok(format!(
+                    "{}: {}",
+                    python_repr(&Value::String(k.clone()))?,
+                    python_repr(v)?
+                )))
+                .collect::<Result<Vec<_>>>()?
+                .join(", ")
+        ),
+    })
+}
+fn python_repr(value: &Value) -> Result<String> {
+    let Value::String(_) = value else {
+        return python_str(value);
+    };
+    let s = python_str(value)?;
+    let quote = if s.contains('\'') && !s.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    let mut out = quote.to_string();
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\\' => out.push_str("\\\\"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    Ok(out)
+}
+fn kind_items(kinds: &Value) -> Result<Vec<Value>> {
+    match kinds {
+        Value::Array(items) => Ok(items.clone()),
+        Value::String(points) => Ok(points.iter().map(|p| Value::String(vec![*p])).collect()),
+        Value::Object(items) => Ok(items
+            .iter()
+            .map(|(k, _)| Value::String(k.clone()))
+            .collect()),
+        _ => Err(util::invalid("invalid tombstone kinds")),
+    }
+}
+fn utf8_path(path: &Path) -> bool {
+    if path.to_str().is_some() {
+        return true;
+    }
+    util::log("WARN", "ingest: non-UTF-8 name skipped");
+    false
 }
 fn empty_object() -> Value {
     Value::Object(vec![])
@@ -141,7 +346,8 @@ fn subagent_files(session: &Path) -> Vec<PathBuf> {
     }
     let mut paths: Vec<_> = entries(&sub)
         .filter(|e| {
-            e.file_type().is_ok_and(|t| t.is_file())
+            utf8_path(&e.path())
+                && e.file_type().is_ok_and(|t| t.is_file())
                 && e.file_name()
                     .to_str()
                     .is_some_and(|s| s.starts_with("agent-") && s.ends_with(".jsonl"))
@@ -160,10 +366,13 @@ fn entries(path: &Path) -> impl Iterator<Item = fs::DirEntry> {
 fn discover() -> Vec<PathBuf> {
     let mut out = codex::paths();
     for project in entries(&util::projects_dir()) {
-        if !project.file_type().is_ok_and(|t| t.is_dir()) {
+        if !utf8_path(&project.path()) || !project.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
         for entry in entries(&project.path()) {
+            if !utf8_path(&entry.path()) {
+                continue;
+            }
             let Ok(kind) = entry.file_type() else {
                 continue;
             };
@@ -247,10 +456,10 @@ impl Shipper {
     fn bump(&mut self, key: &'static str, count: u64) {
         *self.stats.entry(key).or_default() += count;
     }
-    fn entry_for(&self, path: &str, st: &Metadata) -> Value {
+    fn entry_for(&self, path: &str, st: &Metadata) -> Result<Value> {
         let mut entry = get(self.state.files(), path).clone();
         if matches!(entry, Value::Null) {
-            return object([
+            return Ok(object([
                 ("dev", number(st.dev())),
                 ("inode", number(st.ino())),
                 ("size", number(0)),
@@ -258,14 +467,27 @@ impl Shipper {
                 ("generation", number(0)),
                 ("session_key", Value::Null),
                 ("last_ok", Value::Null),
-            ]);
+            ]));
         }
+        if !matches!(entry, Value::Object(_)) {
+            return Err(util::invalid("invalid state entry"));
+        }
+        let stored_offset = if util::has(&entry, "offset") {
+            get(&entry, "offset").clone()
+        } else {
+            number(0)
+        };
         if integer(get(&entry, "dev")) != Some(st.dev())
             || integer(get(&entry, "inode")) != Some(st.ino())
-            || st.len() < integer(get(&entry, "offset")).unwrap_or(0)
+            || offset_cmp(&stored_offset, st.len())?.is_gt()
         {
-            let generation = integer(get(&entry, "generation")).unwrap_or(0) + 1;
-            set(&mut entry, "generation", number(generation));
+            let generation = increment_generation(if util::has(&entry, "generation") {
+                get(&entry, "generation")
+            } else {
+                &Value::Bool(false)
+            })?;
+            set(&mut entry, "generation", generation.clone());
+            let generation = compact(&generation)?;
             set(&mut entry, "offset", number(0));
             set(&mut entry, "dev", number(st.dev()));
             set(&mut entry, "inode", number(st.ino()));
@@ -275,7 +497,7 @@ impl Shipper {
                 &format!("ingest: {path} rewritten or truncated -> generation {generation}"),
             );
         }
-        entry
+        Ok(entry)
     }
     fn read_segment(file: &mut File, offset: u64, size: u64, limit: usize) -> ShipResult<Segment> {
         file.seek(SeekFrom::Start(offset))?;
@@ -320,6 +542,12 @@ impl Shipper {
             if let Some(output) = masked.output {
                 if masked.route == "tombstone" {
                     self.bump("tombstones", 1);
+                    if output.contains("\"reason\":\"surrogate\"") {
+                        util::log(
+                            "WARN",
+                            &format!("ingest: surrogate at offset {position} -> tombstoned"),
+                        );
+                    }
                 }
                 for (kind, count) in masked.counts {
                     *counts.entry(kind).or_default() += count;
@@ -349,14 +577,19 @@ impl Shipper {
         info: &Value,
         path: &str,
         entry: &Value,
-        offset: u64,
         end: u64,
         lines: &[String],
-    ) -> Value {
+    ) -> Result<Value> {
+        if !util::has(entry, "generation") {
+            return Err(util::invalid("missing state generation"));
+        }
         let mut file = object([
             ("session_id", get(info, "session_id").clone()),
             ("project_dir", get(info, "project_dir").clone()),
-            ("jsonl_path", string(path)),
+            (
+                "jsonl_path",
+                string(codex::absolute(Path::new(path)).to_string_lossy()),
+            ),
             ("kind", get(info, "kind").clone()),
         ]);
         for key in ["source", "parent_session_id", "agent_id"] {
@@ -365,7 +598,7 @@ impl Shipper {
             }
         }
         let payload = format!("{}\n", lines.join("\n"));
-        object([
+        Ok(object([
             (
                 "client",
                 object([
@@ -379,13 +612,13 @@ impl Shipper {
                 "segment",
                 object([
                     ("generation", get(entry, "generation").clone()),
-                    ("offset", number(offset)),
+                    ("offset", get(entry, "offset").clone()),
                     ("end_offset", number(end)),
                     ("sha256", string(digest(payload.as_bytes()))),
                     ("lines", Value::Array(lines.iter().map(string).collect())),
                 ]),
             ),
-        ])
+        ]))
     }
     fn send(
         &mut self,
@@ -399,16 +632,19 @@ impl Shipper {
         let (offset, end) = range;
         for _ in 0..3 {
             self.check_budget()?;
-            let body = self.body(info, path, entry, offset, end, &lines);
+            let body = self.body(info, path, entry, end, &lines)?;
             let response = self.api.post("/ingest", &body, true, None)?;
-            let data = response.json().unwrap_or(Value::Null);
+            let data = response_json(&response.body);
             match response.status {
                 200..=299 => {
                     if text(get(&data, "session_key")).is_some_and(|s| !s.is_empty()) {
                         set(entry, "session_key", get(&data, "session_key").clone());
                     }
-                    let next = integer(get(&data, "next_offset"))
-                        .map_or_else(|| number(end), |_| get(&data, "next_offset").clone());
+                    let next = if nonnegative_integer(get(&data, "next_offset")) {
+                        get(&data, "next_offset").clone()
+                    } else {
+                        number(end)
+                    };
                     set(entry, "offset", next);
                     set(entry, "last_ok", string(util::iso(util::now_epoch())));
                     self.bump("segments", 1);
@@ -416,7 +652,8 @@ impl Shipper {
                     return Ok(Outcome::Ok);
                 }
                 409 => {
-                    let expected = integer(get(&data, "expected_offset"))
+                    let expected = python_integer(get(&data, "expected_offset"))
+                        .filter(|s| !s.starts_with('-'))
                         .ok_or_else(|| ship_error("409 without a usable expected_offset"))?;
                     util::log(
                         "WARN",
@@ -461,7 +698,15 @@ impl Shipper {
                     }
                     util::log(
                         "WARN",
-                        &format!("ingest: {path} 422 at offset {offset} -> tombstoned"),
+                        &format!(
+                            "ingest: {path} 422 at offset {offset} lines={} kinds={} -> tombstoned",
+                            python_str(&Value::Array(indexes.clone()))?,
+                            kind_items(&kinds)?
+                                .iter()
+                                .map(python_str)
+                                .collect::<Result<Vec<_>>>()?
+                                .join(",")
+                        ),
                     );
                 }
                 status => return Err(ship_error(&format!("/ingest answered HTTP {status}"))),
@@ -474,7 +719,7 @@ impl Shipper {
         if util::is(get(&info, "source"), "codex") {
             if self.codex_ready.is_none() {
                 let response = self.api.get("/status", &[], None)?;
-                let data = response.json().unwrap_or(Value::Null);
+                let data = response_json(&response.body);
                 if response.status != 200 || !matches!(data, Value::Object(_)) {
                     return Err(ship_error("server capability check failed"));
                 }
@@ -499,7 +744,7 @@ impl Shipper {
         let path = path
             .to_str()
             .ok_or_else(|| ship_error("non-UTF-8 path skipped"))?;
-        let mut entry = self.entry_for(path, &st);
+        let mut entry = self.entry_for(path, &st)?;
         let result = self.ship_open(path, &info, &mut file, &st, &mut entry);
         set(self.state.files_mut(), path, entry);
         result
@@ -514,11 +759,12 @@ impl Shipper {
     ) -> ShipResult<()> {
         let mut limit = MAX_SEGMENT;
         let mut resyncs = 0;
-        if integer(get(entry, "offset")).unwrap_or(0) < st.len() {
+        if offset_cmp(get(entry, "offset"), st.len())?.is_lt() {
             self.bump("files", 1);
         }
-        while integer(get(entry, "offset")).unwrap_or(0) < st.len() {
+        while offset_cmp(get(entry, "offset"), st.len())?.is_lt() {
             self.check_budget()?;
+            let previous_offset = get(entry, "offset").clone();
             let offset = integer(get(entry, "offset"))
                 .ok_or_else(|| util::invalid("invalid state offset"))?;
             let (chunk, forced) = match Self::read_segment(file, offset, st.len(), limit)? {
@@ -549,8 +795,8 @@ impl Shipper {
                     if resyncs > 3 {
                         return Err(ship_error("offset resync did not converge"));
                     }
-                    if integer(get(entry, "offset")).unwrap_or(0) > st.len() {
-                        set(entry, "offset", number(offset));
+                    if offset_cmp(get(entry, "offset"), st.len())?.is_gt() {
+                        set(entry, "offset", previous_offset);
                         return Err(ship_error("server expects offset beyond local size"));
                     }
                 }
@@ -603,7 +849,10 @@ impl Shipper {
         };
         let result = (|| {
             for name in names {
-                let Some(name) = name.to_str() else { continue };
+                let Some(name) = name.to_str() else {
+                    util::log("WARN", "ingest: non-UTF-8 name skipped");
+                    continue;
+                };
                 if !util::valid_tool_result_name(name) {
                     util::log("WARN", "ingest: tool-results name invalid; not sent");
                     continue;
@@ -624,6 +873,9 @@ impl Shipper {
                     continue;
                 }
                 let raw_sha = digest(&raw);
+                if !matches!(sent, Value::Object(_)) {
+                    return Err(util::invalid("invalid state blobs").into());
+                }
                 if util::is(get(&sent, name), &raw_sha) {
                     continue;
                 }
@@ -766,6 +1018,9 @@ pub fn run_ingest(request: &IngestRequest) -> Result<ExitStatus> {
     };
     let (files, budget, mode) = match &request.mode {
         IngestMode::File(path) => {
+            if !utf8_path(path) {
+                return Ok(ExitStatus::Success);
+            }
             if classify(path).is_none() {
                 let message = format!(
                     "{} is not a transcript under {}",
@@ -776,8 +1031,7 @@ pub fn run_ingest(request: &IngestRequest) -> Result<ExitStatus> {
                 say(request.quiet, &format!("ccs: {message}"))?;
                 return Ok(ExitStatus::Usage);
             }
-            let path = codex::absolute(path);
-            let mut files = vec![path.clone()];
+            let mut files = vec![codex::absolute(path)];
             if request.with_subagents {
                 files.extend(subagent_files(&path.with_extension("")));
             }
