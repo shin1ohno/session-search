@@ -199,9 +199,6 @@ class ProcessBoundary(ClientCase):
             os.close(writer)
 
     def test_core_dumps_disabled_before_credential_acquisition(self):
-        if sys.platform != "linux":
-            from .test_cli_review import RustReview
-            return RustReview.test_resume_preserves_hard_core_limit(self)
         import threading
         entered, release = threading.Event(), threading.Event()
         def handler(req):
@@ -226,14 +223,80 @@ class ProcessBoundary(ClientCase):
         def enable_core_for_probe():
             _, hard = resource.getrlimit(resource.RLIMIT_CORE)
             resource.setrlimit(resource.RLIMIT_CORE, (min(1048576, hard) if hard >= 0 else 1048576, hard))
-        process = subprocess.Popen(self.command + ["status"], env=self.env, cwd=self.tmp,
+        env = dict(self.env)
+        observed = Path(self.tmp) / "core-observed"
+        if sys.platform == "darwin":
+            # Observe the running native process at its credential-open boundary.
+            # exec inheritance is a separate contract: the agent gets its soft
+            # limit back only after ccs has finished using its credentials.
+            source = Path(self.tmp) / "core-observer.c"
+            library = Path(self.tmp) / "core-observer.dylib"
+            probe = Path(self.tmp) / "core-observer-probe"
+            source.write_text(r'''
+#include <sys/resource.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <dlfcn.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+static void observe(const char *path) {
+    const char *base = strrchr(path, '/');
+    if (strcmp(base ? base + 1 : path, "client.secret")) return;
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_CORE, &limit)) return;
+    int (*original)(const char *, int, ...) = dlsym(RTLD_NEXT, "open");
+    int fd = original(getenv("CCS_TEST_CORE_OBSERVED"), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return;
+    char result[] = "0 0\n";
+    result[0] = limit.rlim_cur == 0 ? '1' : '0';
+    result[2] = limit.rlim_max == (rlim_t)strtoull(getenv("CCS_TEST_CORE_HARD"), 0, 10) ? '1' : '0';
+    (void)write(fd, result, sizeof(result) - 1);
+    close(fd);
+}
+static int observed_open(const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) { va_list args; va_start(args, flags); mode = va_arg(args, int); va_end(args); }
+    observe(path);
+    int (*original)(const char *, int, ...) = dlsym(RTLD_NEXT, "open");
+    return original(path, flags, mode);
+}
+static int observed_openat(int dir, const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) { va_list args; va_start(args, flags); mode = va_arg(args, int); va_end(args); }
+    observe(path);
+    int (*original)(int, const char *, int, ...) = dlsym(RTLD_NEXT, "openat");
+    return original(dir, path, flags, mode);
+}
+#ifndef PROBE_MAIN
+__attribute__((used)) static struct { const void *replacement; const void *original; }
+interpose[] __attribute__((section("__DATA,__interpose"))) = {
+    {(const void *)observed_open, (const void *)open},
+    {(const void *)observed_openat, (const void *)openat}
+};
+#else
+int main(int argc, char **argv) { int fd = open(argv[1], O_RDONLY); if (fd < 0) return 2; close(fd); return 0; }
+#endif
+''')
+            subprocess.run(["/usr/bin/clang", "-dynamiclib", str(source), "-o", str(library)], check=True)
+            subprocess.run(["/usr/bin/clang", "-DPROBE_MAIN", str(source), "-o", str(probe)], check=True)
+            env.update(DYLD_INSERT_LIBRARIES=str(library), CCS_TEST_CORE_OBSERVED=str(observed),
+                       CCS_TEST_CORE_HARD=str(resource.getrlimit(resource.RLIMIT_CORE)[1]))
+            control = subprocess.run([str(probe), str(secret)], env=env, preexec_fn=enable_core_for_probe)
+            self.assertEqual(control.returncode, 0)
+            self.assertEqual(observed.read_text(), "0 1\n", "observer failed to detect enabled core dumps")
+            observed.unlink()
+        process = subprocess.Popen(self.command + ["status"], env=env, cwd=self.tmp,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=enable_core_for_probe)
         try:
             self.assertTrue(entered.wait(5), "token endpoint was not reached")
-            limit = next(line for line in Path("/proc/%d/limits" % process.pid).read_text().splitlines() if line.startswith("Max core file size"))
-            self.assertEqual(limit.split()[4], "0", "credential-reading process can dump its memory")
-            hard = resource.getrlimit(resource.RLIMIT_CORE)[1]
-            self.assertEqual(limit.split()[5], "unlimited" if hard < 0 else str(hard))
+            if sys.platform == "darwin":
+                self.assertEqual(observed.read_text(), "1 1\n", "credential-reading process has wrong core limits")
+            else:
+                limit = next(line for line in Path("/proc/%d/limits" % process.pid).read_text().splitlines() if line.startswith("Max core file size"))
+                self.assertEqual(limit.split()[4], "0", "credential-reading process can dump its memory")
+                hard = resource.getrlimit(resource.RLIMIT_CORE)[1]
+                self.assertEqual(limit.split()[5], "unlimited" if hard < 0 else str(hard))
         finally:
             release.set()
             output, error = process.communicate(timeout=10)
