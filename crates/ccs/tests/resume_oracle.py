@@ -20,12 +20,15 @@ import pwd
 import re
 import select
 import shutil
+import socket
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
 import time
+import resume_review_cases
+from resume_review_cases import CASES as REVIEW_CASES, BASE_CASE, D5_CASES, amend_fixture
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path[:0] = [str(REPO), str(REPO / 'tests')]
@@ -83,6 +86,8 @@ D11_CASES = {
     'restore-xz-tools': 'xz',
     'restore-bzip2-existing-tools': 'bzip2',
     'restore-xz-existing-tools': 'xz',
+    'restore-lzma-alone': 'xz',
+    'restore-lzma-alone-existing': 'xz',
 }
 
 # (name, expected Python status). The fixture defines each independent input.
@@ -131,6 +136,7 @@ CASES = [(n, code) for n, code in [
     ('codex-surrogate', 4), ('codex-existing', 4), ('codex-force', 17),
     ('codex-root-link', 4), ('codex-date-link', 4),
 ]]
+CASES += REVIEW_CASES
 
 
 def fixture(root, name, base):
@@ -333,30 +339,48 @@ def fixture(root, name, base):
     return req, env, home, response, answers
 
 
-def snapshot(home):
+_base_fixture = fixture
+def fixture(root, name, base):
+    return amend_fixture(root, name, base, _base_fixture(root, BASE_CASE.get(name, name), base), globals())
+
+
+def snapshot(home, preserve_names=False):
     result = {}
     for path in sorted(home.rglob('*')):
         rel = str(path.relative_to(home))
-        rel = re.sub(r'rollout-\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d-', 'rollout-TIME-', rel)
+        if not preserve_names:
+            rel = re.sub(r'rollout-\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d-', 'rollout-TIME-', rel)
+        if rel == '.rss': continue
+        st = path.lstat()
+        mtime = 'NOW' if st.st_mtime > 1700000000 else st.st_mtime_ns
         if path.is_symlink(): result[rel] = {'symlink': os.readlink(path)}
+        elif path.is_dir(): result[rel] = dict(directory=True, mode=stat.S_IMODE(st.st_mode), mtime=mtime)
         elif path.is_file():
-            data = path.read_bytes()
-            if rel.endswith('/restored.json'):
-                data = re.sub(rb'("restored_at": ")[^"]+', rb'\1TIME', data)
-            result[rel] = dict(bytes=data.hex(), mode=stat.S_IMODE(path.stat().st_mode))
+            if st.st_size > 1 << 20:
+                with path.open('rb') as f: data = dict(sha256=hashlib.file_digest(f, 'sha256').hexdigest(), size=st.st_size)
+            else:
+                content = path.read_bytes()
+                if rel.endswith('/restored.json'):
+                    content = re.sub(rb'("restored_at": ")[^"]+', rb'\1TIME', content)
+                data = dict(bytes=content.hex())
+            result[rel] = dict(**data, mode=stat.S_IMODE(st.st_mode), mtime=mtime)
     return result
 
 
-def run_process(command, env, home, answers):
+def run_process(command, env, home, answers, mask=0o022):
     if answers is None:
         return subprocess.run(command, env=env, cwd=home, stdin=subprocess.DEVNULL,
-                              capture_output=True, timeout=15)
+                              capture_output=True, timeout=15, umask=mask)
     master, slave = pty.openpty()
     try:
-        with subprocess.Popen(command, env=env, cwd=home, stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+        with subprocess.Popen(command, env=env, cwd=home, stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE, umask=mask) as proc:
             os.close(slave); slave = -1
             os.write(master, answers)
-            out, err = proc.communicate(timeout=15)
+            try:
+                out, err = proc.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill(); out, err = proc.communicate()
+                return subprocess.CompletedProcess(command, 124, out, err)
             return subprocess.CompletedProcess(command, proc.returncode, out, err)
     finally:
         os.close(master)
@@ -369,6 +393,9 @@ def compare(probe, cases, evidence=None):
         root = Path(temp) / 'sandbox'
         response = {}
         def handler(req):
+            if req['path'].endswith('/token'):
+                response['token_requests'] += 1
+                return (200, {'access_token':'synthetic-resume-token', 'expires_in':3600}, {}) if response['token_requests'] == 1 else (500, {}, {})
             if req['path'].endswith('/preview'):
                 return response['preview_status'], {'session':response['meta']}, {}
             if req['path'].endswith('/archive/tool-results'):
@@ -376,33 +403,70 @@ def compare(probe, cases, evidence=None):
                     write(root / 'home/.claude/session-search/restored.json', json.dumps(dict(version=1, sessions={'concurrent/session': {'cwd': '/other'}})))
                 return response['tool_status'], response['tools'], {}
             if req['path'].endswith('/archive'):
+                if name == 'restore-auth-refresh': return 401, {}, {}
                 return response['archive_status'], response['body'], {'X-Archive-Sha256':response['sha']}
             return 404, {}, {}
         server = FakeServer(handler)
+        original_do = server.httpd.RequestHandlerClass._do
+        def network_failure(request):
+            import urllib.parse
+            url = urllib.parse.urlsplit(request.path)
+            tools = url.path.endswith('/archive/tool-results')
+            archive_request = url.path.endswith('/archive')
+            if ((name == 'restore-archive-drop' and archive_request)
+                    or (name == 'restore-archive-truncated' and archive_request)
+                    or (name == 'restore-error-truncated' and archive_request)
+                    or (name == 'restore-tools-error-truncated' and tools)
+                    or (name in ('restore-tools-truncated', 'restore-tools-reset') and tools)):
+                server.requests.append(dict(method=request.command, path=url.path,
+                                            query=dict(urllib.parse.parse_qsl(url.query)), raw=b''))
+                request.close_connection = True
+                if name.endswith('-drop'):
+                    request.connection.shutdown(socket.SHUT_RDWR); return
+                data = response['tools' if tools else 'body']
+                request.send_response(503 if 'error-truncated' in name else 200)
+                request.send_header('Content-Length', str(len(data)+100))
+                if archive_request: request.send_header('X-Archive-Sha256',response['sha'])
+                request.end_headers(); request.wfile.write(data); request.wfile.flush()
+                if name == 'restore-tools-reset':
+                    import struct
+                    time.sleep(0.1)
+                    request.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+                return
+            original_do(request)
+        server.httpd.RequestHandlerClass._do = network_failure
+        server.httpd.RequestHandlerClass.do_GET = network_failure
         try:
             for name, expected_code in cases:
+                resume_review_cases.TARGET_TIME = int(time.time())
                 pair = []
                 for engine in ('python', 'rust'):
                     if root.exists(): shutil.rmtree(root)
-                    root.mkdir()
+                    root.mkdir(mode=0o700)
                     req, env, home, response, answers = fixture(root, name, server.base)
+                    preserve_names = name in ('codex-target-link', 'codex-target-directory')
+                    before = snapshot(home, preserve_names)
                     if name in D11_CASES:
-                        before = snapshot(home)
                         destination = home / '.claude/projects' / encoded(home / "work space's" / '日本') / SID / 'tool-results'
                         destination_existed = destination.exists()
                     arg = json.dumps(req)
                     command = [sys.executable, '-c', PYTHON, str(REPO), arg] if engine == 'python' else [str(probe), arg]
+                    if name == 'restore-large-member':
+                        command = [sys.executable, str(Path(__file__).with_name('resume_measure.py')), str(home/'.rss'), *command]
                     server.requests.clear()
                     # A pooled HTTP socket can reuse fd 2 after it was closed.
                     server.httpd.RequestHandlerClass.protocol_version = ('HTTP/1.1' if name.endswith('closed-stderr') else 'HTTP/1.0')
-                    result = run_process(command, env, home, answers)
+                    process_cwd = Path(os.fsdecode(bytes.fromhex(req['_process_cwd']))) if '_process_cwd' in req else home
+                    result = run_process(command, env, process_cwd, answers, 0o002 if name == 'restore-umask' else 0o022)
                     observed = dict(exit=result.returncode, stdout=result.stdout.decode('utf-8', 'replace'),
-                                    stderr=result.stderr.decode('utf-8', 'replace'), files=snapshot(home),
+                                    stderr=result.stderr.decode('utf-8', 'replace'), files=snapshot(home, preserve_names),
                                     http=[{k:r[k] for k in ('method','path','query','raw')} for r in server.requests])
                     for r in observed['http']: r['raw'] = r['raw'].hex()
                     if name in D11_CASES:
                         observed.update(initial_files=before, destination_existed=destination_existed,
                                         destination_exists=destination.exists())
+                    if name in D5_CASES: observed['initial_files'] = before
+                    if name == 'restore-large-member': observed['rss_kib'] = int((home/'.rss').read_text().splitlines()[-1])
                     pair.append(observed)
                 python, rust = pair
                 deviation = ''
@@ -414,6 +478,14 @@ def compare(probe, cases, evidence=None):
                     if rust['stderr'] != ('' if name.endswith('closed-stderr') else 'ccs: internal error\n'):
                         check_rust['invalid_internal_diagnostic'] = rust['stderr']
                     check_python.pop('stderr'); check_rust.pop('stderr')
+                if name == 'restore-archive-drop':
+                    # Transport wording is owned by the HTTP boundary; preserve
+                    # the reachability status, request trace and every side effect.
+                    checks['transport_diagnostic'] = rust['stderr'].startswith('ccs: server unreachable: ') and rust['stderr'].count('\n') == 1
+                    check_python.pop('stderr'); check_rust.pop('stderr')
+                if name == 'restore-large-member':
+                    checks['bounded_rss'] = 0 < rust['rss_kib'] < 80*1024 and 0 < python['rss_kib'] < 80*1024
+                    check_python.pop('rss_kib'); check_rust.pop('rss_kib')
                 if name in ('restore-tar-newline', 'remote-newline-id'):
                     deviation = 'D1'
                     passed = python['exit'] == 17 and rust['exit'] == 4 and 'exec.json' not in rust['files']
@@ -430,14 +502,21 @@ def compare(probe, cases, evidence=None):
                         exit_4=rust['exit'] == 4, empty_stdout=rust['stdout'] == '',
                         one_line_reason=rust['stderr'] == reason,
                         http_requests=rust['http'] == python['http'],
-                        no_writes=rust['files'] == rust['initial_files'],
+                        no_writes={p:v for p,v in rust['files'].items() if not v.get('directory')} == {p:v for p,v in rust['initial_files'].items() if not v.get('directory')},
+                        destination_metadata={p:v for p,v in rust['files'].items() if '/tool-results' in p} == {p:v for p,v in rust['initial_files'].items() if '/tool-results' in p},
                         destination_unchanged=rust['destination_exists'] == rust['destination_existed'])
+                    passed = all(checks.values())
+                elif name in D5_CASES:
+                    deviation = 'D5'
+                    checks = dict(python_exec=python['exit'] == 17, exit_4=rust['exit'] == 4,
+                                  warning=rust['stderr'] == 'ccs: WARN: refusing non-UTF-8 resume cwd\n',
+                                  no_writes=rust['files'] == rust['initial_files'])
                     passed = all(checks.values())
                 elif name == 'local-deep-line':
                     deviation = 'D10'
                     passed = python['exit'] == 1 and 'RecursionError' in python['stderr'] and rust['exit'] == 17
                 else:
-                    passed = python['exit'] == expected_code and check_python == check_rust
+                    passed = python['exit'] == expected_code and check_python == check_rust and all(checks.values())
                 observation = dict(case=name, pass_=passed, deviation=deviation, checks=checks, python=python, rust=rust)
                 observations.append(observation)
                 if not passed:
@@ -458,6 +537,8 @@ def compare(probe, cases, evidence=None):
 
 
 def main():
+    from resume_printable import verify
+    verify()
     parser = argparse.ArgumentParser()
     parser.add_argument('probe', nargs='?', default=str(REPO / 'target/release/examples/resume_probe'))
     parser.add_argument('--case', action='append')

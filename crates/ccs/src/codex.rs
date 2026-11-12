@@ -27,6 +27,7 @@ pub fn absolute(path: &Path) -> PathBuf {
     out
 }
 pub fn home() -> PathBuf {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     let path = std::env::var_os("CODEX_HOME")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
@@ -35,6 +36,49 @@ pub fn home() -> PathBuf {
         util::home()
     } else if let Ok(tail) = path.strip_prefix("~/") {
         util::home().join(tail)
+    } else if path.as_os_str().as_bytes().starts_with(b"~") {
+        let bytes = path.as_os_str().as_bytes();
+        let end = bytes.iter().position(|&b| b == b'/').unwrap_or(bytes.len());
+        let expanded = std::ffi::CString::new(&bytes[1..end])
+            .ok()
+            .and_then(|name| {
+                let mut size = 4096;
+                loop {
+                    let mut buffer = vec![0_u8; size];
+                    let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+                    let mut result = std::ptr::null_mut();
+                    // SAFETY: the name and writable buffers remain live; the
+                    // passwd entry is read only after a successful lookup.
+                    let error = unsafe {
+                        libc::getpwnam_r(
+                            name.as_ptr(),
+                            pwd.as_mut_ptr(),
+                            buffer.as_mut_ptr().cast(),
+                            buffer.len(),
+                            &mut result,
+                        )
+                    };
+                    if error == libc::ERANGE {
+                        size *= 2;
+                        continue;
+                    }
+                    if error != 0 || result.is_null() {
+                        return None;
+                    }
+                    let home =
+                        unsafe { std::ffi::CStr::from_ptr(pwd.assume_init().pw_dir) }.to_bytes();
+                    let mut expanded = home.to_vec();
+                    while expanded.last() == Some(&b'/') {
+                        expanded.pop();
+                    }
+                    expanded.extend_from_slice(&bytes[end..]);
+                    if expanded.is_empty() {
+                        expanded.push(b'/');
+                    }
+                    return Some(PathBuf::from(std::ffi::OsString::from_vec(expanded)));
+                }
+            });
+        expanded.unwrap_or(path)
     } else {
         path
     };
