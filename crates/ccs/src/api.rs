@@ -591,13 +591,17 @@ impl TokenFlight {
                             tokens.last = None;
                         }
                         for fresh in [false, true] {
-                            let value = tokens
-                                .manager
-                                .acquire(&config, fresh, |credential| {
-                                    fetch_token(&agent, &config, credential, DEFAULT_TIMEOUT)
-                                })?
-                                .value()
-                                .to_owned();
+                            let value = match tokens.manager.acquire(&config, fresh, |credential| {
+                                fetch_token(&agent, &config, credential, DEFAULT_TIMEOUT)
+                            }) {
+                                Ok(token) => token.value().to_owned(),
+                                Err(error)
+                                    if !fresh && crate::token::is_rejected_token_error(&error) =>
+                                {
+                                    continue
+                                }
+                                Err(error) => return Err(error),
+                            };
                             let hash = bearer_digest(&value);
                             tokens.last = Some(hash);
                             if !rejected(&hash) {

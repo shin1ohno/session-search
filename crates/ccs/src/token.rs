@@ -66,6 +66,10 @@ pub(crate) struct Credential {
     pub secret: String,
     generation: String,
 }
+const REJECTED_TOKEN_ERROR: &str = "token endpoint returned a previously rejected bearer";
+pub(crate) fn is_rejected_token_error(error: &Error) -> bool {
+    matches!(error, Error::Unavailable(message) if message == REJECTED_TOKEN_ERROR)
+}
 const CREDENTIAL_ERROR: &str = "client secret unreadable or empty";
 pub(crate) fn is_credential_error(error: &Error) -> bool {
     matches!(error, Error::Unavailable(message)
@@ -395,14 +399,15 @@ impl TokenManager {
                     let obtained = epoch();
                     let start = Instant::now();
                     let (value, ttl) = fetch(&credential)?;
-                    if !bearer_safe(&value)
-                        || self.rejected.contains(&fingerprint(value.as_bytes()))
+                    if !bearer_safe(&value) {
+                        return Err(Error::Unavailable(
+                            "token endpoint returned an invalid bearer".into(),
+                        ));
+                    }
+                    if self.rejected.contains(&fingerprint(value.as_bytes()))
                         || crate::api::bearer_rejected(&value)
                     {
-                        return Err(Error::Unavailable(
-                            "token endpoint returned an invalid or previously rejected bearer"
-                                .into(),
-                        ));
+                        return Err(Error::Unavailable(REJECTED_TOKEN_ERROR.into()));
                     }
                     let token = Token::fresh(value, ttl, key, obtained, start);
                     if !token.valid_first_send_at(epoch(), Instant::now()) {
