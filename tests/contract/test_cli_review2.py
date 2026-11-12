@@ -1,5 +1,8 @@
 """Oracle regressions for preview encoding, argparse and platform dates."""
 from datetime import datetime, timedelta, timezone
+import argparse
+import contextlib
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -46,8 +49,16 @@ class CliReview2(ClientCase):
         server = self.server()
         for query in ("-h foo", "-hx y"):
             with self.subTest(query=query):
-                result = self.good("search", query)
-                self.assertIn("usage:", result.stdout.lower())
+                # argparse changed attached-help handling between 3.9 and
+                # the native port's pinned 3.13 oracle. Neither sends a query.
+                parser = argparse.ArgumentParser()
+                parser.add_argument("query", nargs="*")
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as expected:
+                        parser.parse_args([query])
+                result = self.run_ccs("search", query)
+                self.assertEqual(result.returncode, expected.exception.code, result.stderr)
+                self.assertIn("usage:", (result.stdout + result.stderr).lower())
                 self.assertEqual(server.requests, [])
 
     def test_since_early_year_uses_this_platform_strftime(self):
