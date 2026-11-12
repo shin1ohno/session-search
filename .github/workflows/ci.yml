@@ -52,6 +52,8 @@ jobs:
         run: |
           python3 crates/ccs/tests/ingest_oracle.py
           python3 crates/ccs/tests/ingest_mutations.py
+      - name: Resume function Python differential gate
+        run: python3 crates/ccs/tests/resume_oracle.py
   dependency-policy:
     runs-on: ubuntu-22.04
     steps:

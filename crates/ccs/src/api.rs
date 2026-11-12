@@ -34,6 +34,15 @@ pub struct Api {
     agent: ureq::Agent,
     tokens: TokenManager,
 }
+#[derive(Default)]
+struct RequestOptions {
+    gzip_body: bool,
+    preserve_body_eof: bool,
+}
+struct BodyReadOptions {
+    limit: Option<u64>,
+    preserve_eof: bool,
+}
 
 impl Api {
     pub fn new(config: Config) -> Self {
@@ -70,6 +79,26 @@ impl Api {
     ) -> Result<Response> {
         self.request("GET", path, None, params, false, timeout)
     }
+    /// Archive downloads retain premature body EOF as an internal I/O error.
+    /// Existing requests, including token acquisition, keep their error policy.
+    pub fn get_archive(
+        &mut self,
+        path: &str,
+        params: &[(&str, &str)],
+        timeout: Option<Duration>,
+    ) -> Result<Response> {
+        self.request_with_options(
+            "GET",
+            path,
+            None,
+            params,
+            RequestOptions {
+                preserve_body_eof: true,
+                ..RequestOptions::default()
+            },
+            timeout,
+        )
+    }
     pub fn post(
         &mut self,
         path: &str,
@@ -86,6 +115,27 @@ impl Api {
         body: Option<&Value>,
         params: &[(&str, &str)],
         gzip_body: bool,
+        timeout: Option<Duration>,
+    ) -> Result<Response> {
+        self.request_with_options(
+            method,
+            path,
+            body,
+            params,
+            RequestOptions {
+                gzip_body,
+                ..RequestOptions::default()
+            },
+            timeout,
+        )
+    }
+    fn request_with_options(
+        &mut self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        params: &[(&str, &str)],
+        options: RequestOptions,
         timeout: Option<Duration>,
     ) -> Result<Response> {
         // A path is appended to the configured origin; never accept an
@@ -105,7 +155,7 @@ impl Api {
             .transpose()?
             .unwrap_or_default()
             .into_bytes();
-        if body.is_some() && gzip_body {
+        if body.is_some() && options.gzip_body {
             let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
             gzip.write_all(&data)
                 .map_err(|_| Error::Unavailable("gzip encoding failed".into()))?;
@@ -130,14 +180,17 @@ impl Api {
                 headers.push(("Authorization", format!("Bearer {}", token.value())));
             }
             // No Content-Encoding: the receiver recognises gzip magic bytes.
-            let response = send(
+            let response = send_with_body_options(
                 &self.agent,
                 method,
                 &url,
                 &headers,
                 &data,
                 timeout.unwrap_or(self.timeout),
-                None,
+                BodyReadOptions {
+                    limit: None,
+                    preserve_eof: options.preserve_body_eof,
+                },
             )?;
             if response.status == 401 && !self.config.is_tailnet() {
                 self.tokens.reject(&self.config);
@@ -205,6 +258,28 @@ fn send(
     timeout: Duration,
     limit: Option<u64>,
 ) -> Result<Response> {
+    send_with_body_options(
+        agent,
+        method,
+        url,
+        headers,
+        data,
+        timeout,
+        BodyReadOptions {
+            limit,
+            preserve_eof: false,
+        },
+    )
+}
+fn send_with_body_options(
+    agent: &ureq::Agent,
+    method: &str,
+    url: &str,
+    headers: &[(&str, String)],
+    data: &[u8],
+    timeout: Duration,
+    options: BodyReadOptions,
+) -> Result<Response> {
     let mut request = ureq::http::Request::builder()
         .method(method)
         .uri(url)
@@ -259,13 +334,25 @@ fn send(
     let status = response.status().as_u16();
     let headers = response.headers().clone();
     let mut body = Vec::new();
-    response
+    let read = response
         .body_mut()
         .as_reader()
-        .take(limit.map_or(u64::MAX, |v| v + 1))
-        .read_to_end(&mut body)
-        .map_err(|_| Error::Unavailable("HTTP response read failed".into()))?;
-    if limit.is_some_and(|v| body.len() as u64 > v) {
+        .take(options.limit.map_or(u64::MAX, |v| v + 1))
+        .read_to_end(&mut body);
+    if options.preserve_eof && status >= 300 && read.is_err() {
+        // urllib's HTTPError path retains the HTTP status even when reading
+        // its diagnostic body fails. Ordinary API callers keep their policy.
+        body.clear();
+    } else {
+        read.map_err(|error| {
+            if options.preserve_eof && error.kind() == std::io::ErrorKind::UnexpectedEof {
+                Error::Io(error)
+            } else {
+                Error::Unavailable("HTTP response read failed".into())
+            }
+        })?;
+    }
+    if options.limit.is_some_and(|v| body.len() as u64 > v) {
         return Err(Error::Unavailable(
             "token endpoint response too large".into(),
         ));
