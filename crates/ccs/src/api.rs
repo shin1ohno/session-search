@@ -537,7 +537,7 @@ struct PoolTokens {
 }
 struct FlightState {
     available: Option<PoolTokens>,
-    failed_until: Option<std::time::Instant>,
+    failure: Option<(std::time::Instant, Error)>,
 }
 #[cfg(test)]
 type AcquireHook = Box<dyn FnOnce(&str) + Send>;
@@ -552,7 +552,7 @@ impl Default for TokenFlight {
         Self {
             state: std::sync::Mutex::new(FlightState {
                 available: Some(PoolTokens::default()),
-                failed_until: None,
+                failure: None,
             }),
             changed: std::sync::Condvar::new(),
             #[cfg(test)]
@@ -562,6 +562,38 @@ impl Default for TokenFlight {
 }
 fn token_failure() -> Error {
     Error::Unavailable("helper token acquisition unavailable".into())
+}
+// A waiter's deadline is not a failed grant or a failed API request. The
+// helper returns an error so its callback can use the ordinary request path.
+#[derive(Debug)]
+struct TokenWaitTimeout;
+impl std::fmt::Display for TokenWaitTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("helper token wait timed out")
+    }
+}
+impl std::error::Error for TokenWaitTimeout {}
+fn token_wait_timeout() -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        TokenWaitTimeout,
+    ))
+}
+pub(crate) fn is_token_wait_timeout(error: &Error) -> bool {
+    matches!(error, Error::Io(e) if e.get_ref().is_some_and(|e| e.is::<TokenWaitTimeout>()))
+}
+fn copy_flight_error(error: &Error) -> Error {
+    match error {
+        Error::Usage(s) => Error::Usage(s.clone()),
+        Error::Unavailable(s) => Error::Unavailable(s.clone()),
+        Error::ResumePrecondition(s) => Error::ResumePrecondition(s.clone()),
+        Error::NotImplemented(s) => Error::NotImplemented(s),
+        Error::Io(e) => Error::Io(
+            e.raw_os_error()
+                .map(std::io::Error::from_raw_os_error)
+                .unwrap_or_else(|| std::io::Error::new(e.kind(), e.to_string())),
+        ),
+    }
 }
 impl TokenFlight {
     fn acquire(
@@ -573,8 +605,13 @@ impl TokenFlight {
         loop {
             let mut state = recover_lock(&self.state);
             let now = std::time::Instant::now();
-            if now >= deadline || state.failed_until.is_some_and(|until| now < until) {
-                return Err(token_failure());
+            if let Some((until, error)) = &state.failure {
+                if now < *until {
+                    return Err(copy_flight_error(error));
+                }
+            }
+            if now >= deadline {
+                return Err(token_wait_timeout());
             }
             if let Some(mut tokens) = state.available.take() {
                 drop(state);
@@ -620,10 +657,12 @@ impl TokenFlight {
                         }
                     };
                     let mut state = recover_lock(&this.state);
-                    state.failed_until = result
-                        .as_ref()
-                        .err()
-                        .map(|_| std::time::Instant::now() + Duration::from_secs(1));
+                    state.failure = result.as_ref().err().map(|error| {
+                        (
+                            std::time::Instant::now() + Duration::from_secs(1),
+                            copy_flight_error(error),
+                        )
+                    });
                     state.available = Some(tokens);
                     drop(state);
                     this.changed.notify_all();
@@ -631,7 +670,10 @@ impl TokenFlight {
                 });
                 let result = receiver
                     .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                    .map_err(|_| token_failure())??;
+                    .map_err(|error| match error {
+                        std::sync::mpsc::RecvTimeoutError::Timeout => token_wait_timeout(),
+                        std::sync::mpsc::RecvTimeoutError::Disconnected => token_failure(),
+                    })??;
                 #[cfg(test)]
                 if let Some(hook) = recover_lock(&self.after_acquire).take() {
                     hook(&result);
@@ -999,7 +1041,7 @@ mod pooled_lock_tests {
         let hash = bearer_digest("synthetic-poison-registry-entry");
         let _ = std::panic::catch_unwind(|| {
             let mut state = flight.state.lock().unwrap();
-            state.failed_until = None;
+            state.failure = None;
             panic!("synthetic coordination panic");
         });
         let _ = std::panic::catch_unwind(|| {

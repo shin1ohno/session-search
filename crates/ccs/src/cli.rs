@@ -135,6 +135,33 @@ fn arg<'a>(matches: &'a ArgMatches, name: &str) -> &'a str {
         .map(String::as_str)
         .unwrap_or("")
 }
+// CPython datetime.strftime delegates year padding to the platform libc.
+fn since_iso(epoch: f64) -> Result<String> {
+    let seconds = epoch.floor() as libc::time_t;
+    let mut calendar: libc::tm = unsafe { std::mem::zeroed() };
+    let mut output = [0u8; 64];
+    let length = unsafe {
+        if libc::gmtime_r(&seconds, &mut calendar).is_null() {
+            return Err(util::invalid("invalid date"));
+        }
+        libc::strftime(
+            output.as_mut_ptr().cast(),
+            output.len(),
+            c"%Y-%m-%dT%H:%M:%SZ".as_ptr(),
+            &calendar,
+        )
+    };
+    String::from_utf8(output[..length].to_vec()).map_err(|_| util::invalid("invalid date"))
+}
+
+static INHERITED_CORE_LIMIT: std::sync::OnceLock<libc::rlim_t> = std::sync::OnceLock::new();
+pub fn remember_core_limit(soft: libc::rlim_t) {
+    let _ = INHERITED_CORE_LIMIT.set(soft);
+}
+pub(crate) fn agent_core_limit() -> Option<libc::rlim_t> {
+    INHERITED_CORE_LIMIT.get().copied()
+}
+
 fn options(matches: &ArgMatches) -> Result<(String, Value)> {
     let mut flags = String::new();
     for (name, letter) in [("semantic", 's'), ("deep", 'd'), ("all", 'a')] {
@@ -175,7 +202,7 @@ fn options(matches: &ArgMatches) -> Result<(String, Value)> {
         if epoch < -62135596800.0 {
             return Err(util::invalid("date precedes year one"));
         }
-        set(&mut opts, "since", string(util::iso(epoch)));
+        set(&mut opts, "since", string(since_iso(epoch)?));
     }
     Ok((flags, opts))
 }
@@ -193,21 +220,26 @@ pub fn output(out: &str) -> Result<()> {
 fn json_output(value: &Value, ascii: bool, sorted: bool) -> Result<()> {
     let points = ccs_pytext::json_dumps_points(value, ascii, sorted)
         .map_err(|_| util::invalid("cannot encode JSON"))?;
+    let mut bytes = stdout_bytes(&points)?;
+    bytes.push(b'\n');
+    io::stdout().write_all(&bytes).map_err(Error::Io)
+}
+pub(crate) fn stdout_bytes(points: &[u32]) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    for point in points {
+    for &point in points {
         if let Some(c) = char::from_u32(point) {
             let mut utf8 = [0; 4];
             bytes.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
         } else if (0xdc80..=0xdcff).contains(&point) {
-            // Python's Unix stdout uses surrogateescape for filesystem bytes.
+            // D12: Unix stdout preserves surrogateescaped filesystem bytes.
             bytes.push((point - 0xdc00) as u8);
         } else {
-            return Err(util::invalid("cannot encode JSON"));
+            return Err(util::invalid("cannot encode output"));
         }
     }
-    bytes.push(b'\n');
-    io::stdout().write_all(&bytes).map_err(Error::Io)
+    Ok(bytes)
 }
+
 fn unavailable(error: Error) -> Error {
     match error {
         Error::Usage(s) => Error::Unavailable(s),
@@ -313,7 +345,7 @@ fn search(matches: &ArgMatches, query: &Query, flags: &str, opts: &Value) -> Res
     json_output(&data, false, false)?;
     Ok(ExitStatus::Success)
 }
-fn preview(key: &str, query: &str) -> Result<ExitStatus> {
+fn preview(key: &str, query: &Query) -> Result<ExitStatus> {
     let data = if let Some(path) = key.strip_prefix("local:") {
         let path = Path::new(path);
         if crate::codex::is_path(path) && crate::codex::classify(path).is_none() {
@@ -354,9 +386,12 @@ fn preview(key: &str, query: &str) -> Result<ExitStatus> {
         ])
     } else {
         let cfg = Config::load(None).map_err(unavailable)?;
+        let query = query
+            .utf8()
+            .ok_or_else(|| util::invalid("invalid URL query"))?;
         let mut api = Api::with_timeout(cfg, Duration::from_secs(5));
         let mut data = response_object(
-            api.get("/preview", &[("session_key", key), ("q", query)], None)
+            api.get("/preview", &[("session_key", key), ("q", &query)], None)
                 .map_err(unavailable)?,
             "/preview",
         )?;
@@ -626,7 +661,12 @@ fn normalize_arguments(
                     .is_some_and(|long| long.starts_with(name.trim_start_matches('-')))
             })
         });
-        let spaced_positional = raw.starts_with('-') && raw.contains(' ') && !known_equals_option;
+        let short_prefix = !raw.starts_with("--")
+            && raw.chars().nth(1).is_some_and(|c| {
+                c == 'h' || parser.get_arguments().any(|a| a.get_short() == Some(c))
+            });
+        let spaced_positional =
+            raw.starts_with('-') && raw.contains(' ') && !known_equals_option && !short_prefix;
         if !escaped && raw == "--" && !takes_value {
             escaped = true;
             normalized.push(value.clone());
@@ -763,12 +803,7 @@ pub fn dispatch(args: &[OsString]) -> Result<ExitStatus> {
         }
         "preview" => {
             let query = Query::from_os(matches.get_one::<OsString>("query").unwrap());
-            preview(
-                arg(&matches, "session_key"),
-                &query
-                    .utf8()
-                    .ok_or_else(|| util::invalid("invalid URL query"))?,
-            )
+            preview(arg(&matches, "session_key"), &query)
         }
         "purge" => purge(arg(&matches, "session_key")),
         "status" => status(),
@@ -820,14 +855,12 @@ pub fn dispatch(args: &[OsString]) -> Result<ExitStatus> {
             }
             let reply = match name {
                 "_backend" => crate::picker::backend_query(&query, &env, None)?,
-                "_preview" => crate::picker::preview(
-                    arg(&matches, "key"),
-                    utf8_query
-                        .as_deref()
-                        .ok_or_else(|| util::invalid("invalid URL query"))?,
-                    &env,
-                    None,
-                )?,
+                "_preview" => {
+                    let bytes =
+                        crate::picker::preview_query(arg(&matches, "key"), &query, &env, None)?;
+                    io::stdout().write_all(&bytes).map_err(Error::Io)?;
+                    return Ok(ExitStatus::Success);
+                }
                 "_toggle" => crate::picker::toggle(arg(&matches, "letter"), &env)? + "\n",
                 "_fuse" => {
                     crate::picker::fuse_query(arg(&matches, "seq"), &query, &env, None)?;

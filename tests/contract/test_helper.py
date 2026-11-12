@@ -261,7 +261,9 @@ class RunWiring(HelperBase):
             probe_command = [str(binary)]
         probe = subprocess.run(prefix + probe_command, env=self.env, cwd=self.tmp, capture_output=True)
         self.assertEqual(probe.returncode, 0, probe.stderr)
-        self.start_picker(prefix=prefix)
+        long_dir = Path(self.tmp) / ("long-socket-parent-" * 8)
+        long_dir.mkdir()
+        self.start_picker(prefix=prefix, env={"TMPDIR": str(long_dir)})
         self.assertIsNone(self.sock)
         result = self.invoke(self.backend_command("query"))
         self.assertEqual(result.returncode, 0, result.stderr)

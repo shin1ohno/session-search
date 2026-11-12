@@ -36,6 +36,7 @@ fn guarded(body: impl FnOnce() -> ExitCode + std::panic::UnwindSafe) -> ExitCode
             ccs::cli::stderr_line("ccs: cannot read core dump limit");
             return ExitCode::from(1);
         }
+        ccs::cli::remember_core_limit(limit.rlim_cur);
         limit.rlim_cur = 0;
         if libc::setrlimit(libc::RLIMIT_CORE, &limit) != 0 {
             ccs::cli::stderr_line("ccs: cannot disable core dumps");

@@ -134,13 +134,13 @@ jobs:
       - run: cargo install --locked --version 0.22.2 cargo-audit
       - run: cargo audit
   test-python3:
-    # Preserve the existing required context while also requiring Rust/policy.
-    needs: [rust, dependency-policy]
+    # Preserve the existing required context while also requiring both Rust platforms/policy.
+    needs: [rust, rust-macos, dependency-policy]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Require Rust and dependency-policy success
-        run: test '${{ needs.rust.result }}' = success && test '${{ needs.dependency-policy.result }}' = success
+      - name: Require Linux Rust, macOS Rust and dependency-policy success
+        run: test '${{ needs.rust.result }}' = success && test '${{ needs.rust-macos.result }}' = success && test '${{ needs.dependency-policy.result }}' = success
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: ccs client suite (runner python3)

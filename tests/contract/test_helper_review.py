@@ -1,10 +1,12 @@
 """Receiver observations for the picker review's cache and socket boundaries."""
+import concurrent.futures
 import json
 import os
 from pathlib import Path
 import socket
 import subprocess
 import threading
+import tempfile
 import time
 import unittest
 
@@ -95,16 +97,20 @@ class RustHelperReview(HelperBase):
             return 200, SESSIONS, {}
         self.srv.handler = handler
         self.start_picker()
-        self.invoke(self.backend_command("first"))
+        first = self.invoke(self.backend_command("first"))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn(b"sk_1\t", first.stdout)
         self.assertTrue(completed.wait(3))
         time.sleep(.15)
         result = self.invoke(self.backend_command("second"))
         self.assertIn(b"sk_1\t", result.stdout)
         self.assertEqual(len(grants), 1, "grant incorrectly inherited the lexical deadline")
-        self.assertEqual(len(self.srv.of("/search")), 1)
+        self.assertEqual(len(self.srv.of("/search")), 2)
 
     def test_truncated_helper_body_falls_back_to_normal_request(self):
-        path = Path(self.tmp) / "truncated.sock"
+        short = tempfile.TemporaryDirectory(prefix="ccs-sock-", dir="/tmp")
+        self.addCleanup(short.cleanup)
+        path = Path(short.name) / "s"
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
             server.bind(str(path))
             server.listen()
@@ -120,5 +126,51 @@ class RustHelperReview(HelperBase):
             finally:
                 thread.join(5)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sk_1\t", result.stdout)
+        self.assertEqual(len(self.srv.of("/search")), 1)
+
+    def test_inflight_waiters_do_not_open_breaker(self):
+        self.auth()
+        started = threading.Event()
+        def handler(request):
+            if request["path"] == "/token":
+                started.set()
+                time.sleep(1.5)
+                return 200, {"access_token": synthetic(1), "expires_in": 3599}, {}
+            return 200, SESSIONS, {}
+        self.srv.handler = handler
+        self.start_picker()
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            first = pool.submit(self.invoke, self.backend_command("first"))
+            self.assertTrue(started.wait(3))
+            time.sleep(.3)
+            second = pool.submit(self.invoke, self.backend_command("second"))
+            results = [first.result(), second.result()]
+        results.append(self.invoke(self.backend_command("third")))
+        for result in results:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(b"sk_1\t", result.stdout)
+        self.assertEqual(len(self.srv.of("/search")), 3)
+        state = json.loads(self.breaker_path.read_text()) if self.breaker_path.exists() else {}
+        self.assertEqual(state.get("failures", 0), 0)
+        self.assertEqual(state.get("open_until", 0), 0)
+
+    def test_missing_secret_remains_internal_error_for_all_waiters(self):
+        self.auth()
+        (Path(self.tmp) / ".config/session-search/client.secret").unlink()
+        self.start_picker()
+        command = self.argv[self.argv.index("--preview") + 1]
+        command = command.replace("{1}", "sk_2").replace("{q}", "query")
+        for _ in range(3):
+            result = self.invoke(command)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(result.stdout, b"")
+        self.assertEqual(self.srv.requests, [])
+        state = json.loads(self.breaker_path.read_text()) if self.breaker_path.exists() else {}
+        self.assertEqual(state.get("failures", 0), 0)
+
+    def test_overlong_helper_socket_falls_back_to_normal_request(self):
+        socket_path = str(Path(self.tmp) / ("long-" * 30) / "s")
+        result = self.good("_backend", "query", env={"CCS_HELPER_SOCKET": socket_path})
         self.assertIn("sk_1\t", result.stdout)
         self.assertEqual(len(self.srv.of("/search")), 1)

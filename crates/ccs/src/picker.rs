@@ -7,7 +7,7 @@ use crate::helper::SharedApi;
 use crate::query::Query;
 use crate::util::{self, get, object, set, string, text, truthy};
 use ccs_pytext::json::Value;
-use ccs_pytext::{casefold, shell_quote, split};
+use ccs_pytext::{casefold_points, shell_quote, split};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
@@ -643,31 +643,72 @@ pub fn preview(
     _env: &Environment,
     shared: Option<&Arc<SharedApi>>,
 ) -> Result<String> {
-    if key == "-" {
-        return Ok("Offline fallback: only this host's local transcripts are searched (text only, no archive,\nno other hosts, no semantic). Resume works for local files only.\n".into());
-    }
+    String::from_utf8(preview_query(key, &Query::from(q), _env, shared)?)
+        .map_err(|_| util::invalid("preview needs surrogateescape output"))
+}
+pub fn preview_query(
+    key: &str,
+    q: &Query,
+    env: &Environment,
+    shared: Option<&Arc<SharedApi>>,
+) -> Result<Vec<u8>> {
     if let Some(path) = key.strip_prefix("local:") {
-        let s = crate::extract::scan_checked(Path::new(path), Some(q), 4)?;
-        let mut out = format!(
-            "\x1b[1m{}\x1b[0m\n{}\n{}\n\n",
-            clean(
-                &string(if s.title.is_empty() {
-                    "(untitled)"
-                } else {
-                    &s.title
-                }),
-                0
-            ),
-            s.resume_cwd(),
-            s.path.display()
+        let s = crate::extract::scan_checked_points(Path::new(path), q.points(), 4)?;
+        let value = s.value();
+        let mut out: Vec<u32> = "\x1b[1m".chars().map(u32::from).collect();
+        out.extend(clean_points(
+            default(get(&value, "title"), &string("(untitled)")),
+            0,
+        ));
+        out.extend(
+            format!("\x1b[0m\n{}\n{}\n\n", s.resume_cwd(), s.path.display())
+                .chars()
+                .map(u32::from),
         );
-        let ql = casefold(q);
-        for (role, text) in &s.last_texts {
-            if ql.is_empty() || casefold(text).contains(&ql) {
-                out.push_str(&format!("[{role}] {}\n\n", clean(&string(text), 400)));
+        let ql = casefold_points(q.points());
+        if let Value::Array(rows) = get(&value, "last_texts") {
+            for row in rows {
+                let Value::Array(parts) = row else { continue };
+                let Value::String(points) = &parts[1] else {
+                    continue;
+                };
+                let folded = casefold_points(points);
+                if ql.is_empty() || folded.windows(ql.len()).any(|w| w == ql) {
+                    out.extend(format!("[{}] ", display(&parts[0])).chars().map(u32::from));
+                    out.extend(clean_points(&parts[1], 400));
+                    out.extend([10, 10]);
+                }
             }
         }
-        return Ok(out);
+        return crate::cli::stdout_bytes(&out);
+    }
+    preview_remote(key, q, env, shared).map(String::into_bytes)
+}
+fn clean_points(value: &Value, width: usize) -> Vec<u32> {
+    let Value::String(points) = value else {
+        return clean(value, width).chars().map(u32::from).collect();
+    };
+    let mut out = Vec::new();
+    for word in ccs_pytext::split_points(points) {
+        if !out.is_empty() {
+            out.push(32);
+        }
+        out.extend_from_slice(word);
+    }
+    if width > 0 && out.len() > width {
+        out.truncate(width - 1);
+        out.push(0x2026);
+    }
+    out
+}
+fn preview_remote(
+    key: &str,
+    q: &Query,
+    _env: &Environment,
+    shared: Option<&Arc<SharedApi>>,
+) -> Result<String> {
+    if key == "-" {
+        return Ok("Offline fallback: only this host's local transcripts are searched (text only, no archive,\nno other hosts, no semantic). Resume works for local files only.\n".into());
     }
     let cfg = match Config::load(None) {
         Ok(cfg) => cfg,
@@ -677,19 +718,21 @@ pub fn preview(
     if breaker.is_open() {
         return Ok("server unavailable (circuit open); preview needs the server\n".into());
     }
+    let q = q.utf8().ok_or_else(|| util::invalid("invalid URL query"))?;
     let resp = match api_request(
         &cfg,
         shared,
         "GET",
         "/preview",
         None,
-        &[("session_key", key), ("q", q)],
+        &[("session_key", key), ("q", &q)],
         Duration::from_millis(1500),
     ) {
         Ok(resp) => resp,
         Err(error) if crate::token::is_credential_error(&error) => {
             return Err(util::invalid("client secret unreadable"))
         }
+        Err(error) if crate::api::is_token_wait_timeout(&error) => return Err(error),
         Err(e) => {
             breaker.record_failure()?;
             return Ok(format!("server unreachable: {}\n", crate::cli::message(&e)));

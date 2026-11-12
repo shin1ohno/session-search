@@ -108,7 +108,7 @@ class CliReview(ClientCase):
 
 @unittest.skipUnless(os.environ.get("CCS_RUST_CLIENT") == "1", "Rust process and token-state extension")
 class RustReview(ClientCase):
-    def test_resume_preserves_hard_core_limit(self):
+    def test_resume_preserves_inherited_core_limits(self):
         cwd = Path(self.tmp) / "work"
         cwd.mkdir()
         path = self.transcript([user("resume", cwd=str(cwd))], cwd=str(cwd))
@@ -116,14 +116,17 @@ class RustReview(ClientCase):
                   "Path(os.environ['CCS_EXEC_LOG']).write_text(json.dumps({'core':resource.getrlimit(resource.RLIMIT_CORE)}))\n")
         inherited = resource.getrlimit(resource.RLIMIT_CORE)[1]
         self.assertNotEqual(inherited, 0)
-        def enable_soft_limit():
-            _, hard = resource.getrlimit(resource.RLIMIT_CORE)
-            resource.setrlimit(resource.RLIMIT_CORE, (min(hard, 1048576) if hard >= 0 else 1048576, hard))
-        result = subprocess.run(self.command + ["resume", "local:" + path, "--to", str(cwd)],
-                                env=self.env, cwd=self.tmp, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                preexec_fn=enable_soft_limit, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(self.exec_path.read_text())["core"], [0, inherited])
+        for soft in (1048576, resource.RLIM_INFINITY):
+            with self.subTest(soft=soft):
+                if inherited >= 0:
+                    soft = min(inherited, soft) if soft >= 0 else inherited
+                def enable_soft_limit():
+                    resource.setrlimit(resource.RLIMIT_CORE, (soft, inherited))
+                result = subprocess.run(self.command + ["resume", "local:" + path, "--to", str(cwd)],
+                                        env=self.env, cwd=self.tmp, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        preexec_fn=enable_soft_limit, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(self.exec_path.read_text())["core"], [soft, inherited])
 
     def test_status_reports_refreshed_disk_and_rejected_token_state(self):
         from contract import test_auth
