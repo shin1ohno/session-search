@@ -1,5 +1,6 @@
 """Observable process safety and additional local-reader integration cases."""
 import json
+import errno
 import os
 from pathlib import Path
 import signal
@@ -121,14 +122,25 @@ class DispatchAdapter(ClientCase):
                  "private\U000f0001", "." + "a" * 100]
         for name in names:
             (directory / name).write_text("skip")
-        (directory / "surrogate\udc80").write_text("skip")
+        raw_name_supported = True
+        with self.subTest(filename="non-UTF-8 filesystem bytes"):
+            try:
+                (directory / "surrogate\udc80").write_text("skip")
+            except OSError as error:
+                # APFS rejects this name before either client can read it.
+                self.assertEqual(sys.platform, "darwin")
+                self.assertEqual(error.errno, errno.EILSEQ)
+                raw_name_supported = False
+                self.skipTest("filesystem rejects non-UTF-8 filename with EILSEQ; UTF-8 repr cases still run")
         self.good("ingest", "--file", str(path), "--quiet")
         lines = self.log_path.read_text().splitlines()
         for name in names:
             warning = "ingest: tool-results name %r does not match ^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$; not sent" % name[:80]
             with self.subTest(name=name):
                 self.assertTrue(any(line.endswith(warning) for line in lines), warning)
-        if os.environ.get("CCS_RUST_CLIENT") == "1":
+        if not raw_name_supported:
+            self.assertFalse(any("non-UTF-8 name skipped" in line for line in lines))
+        elif os.environ.get("CCS_RUST_CLIENT") == "1":
             # D5 rejects the raw non-UTF-8 filename before the repr formatter.
             self.assertEqual(sum("non-UTF-8 name skipped" in line for line in lines), 1)
         else:

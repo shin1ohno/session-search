@@ -236,17 +236,30 @@ class RunWiring(HelperBase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, self.rows("query").encode())
 
-    @unittest.skipUnless(sys.platform == "linux" and platform.machine() in ("x86_64", "aarch64"),
-                         "bind fault injection requires the Linux syscall ABI")
+    @unittest.skipUnless(sys.platform == "darwin" or
+                         (sys.platform == "linux" and platform.machine() in ("x86_64", "aarch64")),
+                         "bind fault injection requires a supported Unix ABI")
     def test_bind_failure_keeps_the_process_wiring(self):
         prefix = [sys.executable, str(Path(__file__).with_name("deny_bind.py"))]
         # Prove that failure is our injected errno, not a launcher/environment failure.
-        probe = subprocess.run(prefix + [sys.executable, "-c", "import socket,errno\n"
-                               "s=socket.socket(socket.AF_UNIX)\n"
-                               "try: s.bind('unused')\n"
-                               "except OSError as e: assert e.errno==errno.EADDRINUSE\n"
-                               "else: raise AssertionError('bind unexpectedly worked')\n"
-                               "finally: s.close()"], env=self.env, cwd=self.tmp, capture_output=True)
+        probe_command = [sys.executable, "-c", "import socket,errno\n"
+                         "s=socket.socket(socket.AF_UNIX)\n"
+                         "try: s.bind('unused')\n"
+                         "except OSError as e: assert e.errno==errno.EADDRINUSE\n"
+                         "else: raise AssertionError('bind unexpectedly worked')\n"
+                         "finally: s.close()"]
+        if sys.platform == "darwin":
+            # Probe the native executable boundary; a signed system Python can
+            # ignore DYLD environment variables independently of ccs.
+            source = Path(self.tmp) / "bind-probe.c"
+            binary = Path(self.tmp) / "bind-probe"
+            source.write_text("#include <sys/socket.h>\n#include <sys/un.h>\n#include <errno.h>\n"
+                              "int main(void) { struct sockaddr_un a = {0}; a.sun_family = AF_UNIX; "
+                              "a.sun_path[0] = 'x'; int fd = socket(AF_UNIX, SOCK_STREAM, 0); "
+                              "return !(bind(fd, (struct sockaddr *)&a, sizeof(a)) == -1 && errno == EADDRINUSE); }\n")
+            subprocess.run(["/usr/bin/clang", str(source), "-o", str(binary)], check=True)
+            probe_command = [str(binary)]
+        probe = subprocess.run(prefix + probe_command, env=self.env, cwd=self.tmp, capture_output=True)
         self.assertEqual(probe.returncode, 0, probe.stderr)
         self.start_picker(prefix=prefix)
         self.assertIsNone(self.sock)

@@ -76,10 +76,15 @@ class AuthReviewContract(test_auth.AuthContract):
         self.assertIsNotNone(openssl, "openssl required for hermetic TLS contract")
         cert = Path(self.tmp) / (name + ".pem")
         key = Path(self.tmp) / (name + ".key")
+        # A complete private config avoids inheriting system CA extensions and
+        # duplicating basicConstraints with LibreSSL's -addext behaviour.
+        config = Path(self.tmp) / (name + ".cnf")
+        config.write_text("[req]\ndistinguished_name=dn\n[dn]\n[leaf]\n"
+                          "subjectAltName=IP:127.0.0.1,DNS:localhost\n"
+                          "basicConstraints=critical,CA:FALSE\n")
         result = subprocess.run([openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                                  "-days", "1", "-keyout", str(key), "-out", str(cert),
-                                 "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost",
-                                 "-addext", "basicConstraints=critical,CA:FALSE"],
+                                 "-subj", "/CN=localhost", "-config", str(config), "-extensions", "leaf"],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
         self.assertEqual(result.returncode, 0, "local test certificate generation failed")
         return cert, key
