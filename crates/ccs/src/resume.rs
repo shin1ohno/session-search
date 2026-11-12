@@ -43,19 +43,13 @@ impl Diagnostics {
             return Err(Error::Io(io::Error::from_raw_os_error(libc::EBADF)));
         }
         let line = format!("{message}\n");
-        // SAFETY: line stays live; fd 2 is borrowed, never closed here.
-        let written = unsafe { libc::write(libc::STDERR_FILENO, line.as_ptr().cast(), line.len()) };
-        if written < 0 {
-            Err(Error::Io(io::Error::last_os_error()))
-        } else {
-            Ok(())
-        }
+        util::stderr_write(line.as_bytes()).map_err(Error::Io)
     }
 }
 fn display(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
-fn repr(value: &Value) -> String {
+pub(crate) fn repr(value: &Value) -> String {
     match value {
         Value::Null => "None".into(),
         Value::Bool(v) => if *v { "True" } else { "False" }.into(),

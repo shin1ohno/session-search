@@ -43,7 +43,7 @@ class TokenCacheContract(test_auth.AuthContract):
             ("format", True), ("format", "1"), ("access_token", []),
             ("access_token", "eyJbad.\nvalue.signature"),
             ("expires_at", "999999999999"), ("expires_at", float("inf")),
-            ("obtained_at", float("nan")), ("obtained_at", time.time() + 301),
+            ("obtained_at", float("nan")), ("obtained_at", lambda: time.time() + 301),
             ("expires_at", time.time() + 99999), ("expires_at", time.time() - 1),
             ("endpoint", "https://different.example"), ("token_url", "https://different.example/token"),
             ("client_id", "different"), ("audience", "different"),
@@ -51,7 +51,7 @@ class TokenCacheContract(test_auth.AuthContract):
         ]
         for key, value in cases:
             with self.subTest(field=key):
-                data = dict(original, **{key: value})
+                data = dict(original, **{key: value() if callable(value) else value})
                 self.cache.write_text(json.dumps(data))
                 before = len(self.server.of("/token"))
                 self.assert_clean(self.good("status"))

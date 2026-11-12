@@ -59,14 +59,43 @@ def check_codex():
     print("PASS negative Codex expected-value change: exact vector rejected with repaired checksum")
 
 
+def check_status():
+    # The client command is implemented from S2; all observations stay loopback.
+    sys.path.insert(0, str(root / "tests"))
+    from support import FakeServer
+    with tempfile.TemporaryDirectory(prefix="ccs-status-") as directory:
+        home = Path(directory)
+        config = home / "config.json"
+        key = home / "hmac.key"
+        key.write_text("synthetic-test-key")
+        server = FakeServer(lambda request: (200, {"ok": True}, {}))
+        config.write_text(json.dumps({"endpoint": server.base, "host_label": "test",
+                                      "auth": {"type": "tailnet"}, "hmac_key_file": str(key)}))
+        env = dict(os.environ, HOME=directory, CODEX_HOME=str(home / ".codex"), CCS_CONFIG=str(config),
+                   NO_PROXY="*", no_proxy="*")
+        try:
+            result = subprocess.run([binary, "status"], env=env, cwd=directory, capture_output=True, text=True, timeout=10)
+            assert result.returncode == 0, "real status did not succeed against loopback server"
+            assert 'server:     HTTP 200 {"ok": true}' in result.stdout
+            assert "token:      disabled" in result.stdout
+            assert len(server.requests) == 1 and server.requests[0]["path"] == "/status"
+            print("PASS real status: exit 0 and receiver observed GET /status")
+        finally:
+            server.close()
+        result = subprocess.run([binary, "status"], env=env, cwd=directory, capture_output=True, text=True, timeout=10)
+        assert result.returncode == 3 and "server:     unreachable" in result.stdout, "unreachable status must exit 3"
+        print("PASS unreachable loopback status: exit 3")
+
+
 def check_foundation():
     info = json.loads(subprocess.check_output([binary, "_buildinfo"]))
     assert len(info["commit"]) == 40 and info["version"] == "0.2.0"
     assert subprocess.check_output([binary, "--version"], text=True) == "ccs 0.2.0\n"
-    for args, code in ((["_conformance", "redact"], 1), (["_conformance", "codex"], 1), (["status"], 2)):
+    for args, code in ((["_conformance", "redact"], 1), (["_conformance", "codex"], 1)):
         p = subprocess.run([binary, *args], capture_output=True, text=True)
         assert p.returncode == code and not p.stdout
         print("PASS empty/unsupported command refusal:", *args, "exit", p.returncode)
+    check_status()
     with tempfile.TemporaryDirectory() as work:
         ready = Path(work) / "ready"
         stage = ["bash", str(root / "tools/stage_release.sh")]

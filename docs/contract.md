@@ -222,3 +222,40 @@ The initial A1 session-search pin can use the already merged baseline commit.
 R0 reverts this contract PR and setup's separate corpus/ai-memory-pin commit.
 The independent A1 session-search pin commit can be reverted separately. No Rust
 artifact or host switch is part of S0.
+
+## Rust CLI integration gate
+
+The Rust CI job runs `tests/contract/run_rust.py` against the release binary with
+`CCS_AUTH_DISK_CACHE=1` and `CCS_RUST_CLIENT=1`. Missing flags, any skipped auth
+contract, or a skipped Rust process/helper contract fail the job. The job installs
+a native Codex binary and retains the complete test output, including every skip
+and its reason. `crates/ccs/tests/cli_oracle.py` compares parsing and received
+requests with Python; `cli_interop.py` stages Python with the real vendor modules
+and runs the state tests with both Rust/Python writer-reader assignments.
+
+Rust adds `completion zsh`, the A2 signal/core-dump boundary, and D6's single-line
+panic diagnostic. The regular HTTP client retains `Connection: close`; the picker
+uses one shared HTTP agent with at most two idle connections per host. Only a
+POST /search or GET /preview on a reused connection may be retried once after a
+disconnect before any response bytes. The search body stays identical; each
+attempt acquires a bearer again. Other routes, fresh connections and partial
+responses never receive this transport retry. The existing one-refresh
+401 policy remains separate, with a shared rejected-token registry for concurrent
+helper requests. Loopback tests observe connection counts, overlapping requests,
+response ownership, and 401 recovery through the callbacks given to fzf.
+
+D7 uses the same private helper socket through `ccs _backend`, `_preview` and
+`_toggle`; callbacks carry its path in `CCS_HELPER_SOCKET` and fall back to the
+ordinary process path if the helper is unavailable. No curl executable is needed.
+The helper socket is 0600 inside a 0700 directory; picker exit and handled signals
+remove the directory. No production endpoint is used by these gates.
+
+The helper serializes token acquisition without holding a mutex during credential,
+flock or network I/O. Waiters use their request deadline and share a failed grant
+for one second. A process-wide digest registry survives API config changes and
+poisoned coordination locks. Token grants use a separate agent, so their
+close-per-request connections cannot consume the search/preview pool. TLS
+requests clone the agent's cached certificate configuration; HTTP does not fail
+for an invalid certificate bundle. Endpoint/auth/client/token URL changes rebuild
+the pool. Search/preview response bodies are limited to 4 MiB, and at most 32
+helper callback/fuse workers run concurrently.

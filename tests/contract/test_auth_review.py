@@ -32,6 +32,15 @@ class AuthReviewContract(test_auth.AuthContract):
         self.assertEqual(result.returncode, 3, "credential failure mapped to usage")
         self.assertEqual(self.server.requests, [])
 
+    def test_unreadable_credential_has_exit_status_three(self):
+        self.setup_auth()
+        (self.cdir / "client.secret").chmod(0o000)
+        result = self.run_ccs("status")
+        self.assertEqual(result.returncode, 3, "unreadable credential mapped to usage")
+        self.assertEqual(self.server.requests, [])
+        (self.cdir / "client.secret").chmod(0o600)
+        self.assert_clean(result)
+
     def test_symlinked_credential_is_read(self):
         self.setup_auth()
         secret = self.cdir / "client.secret"

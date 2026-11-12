@@ -54,6 +54,28 @@ jobs:
           python3 crates/ccs/tests/ingest_mutations.py
       - name: Resume function Python differential gate
         run: python3 crates/ccs/tests/resume_oracle.py
+      - name: Rust CLI, auth, helper and state interoperability contracts
+        env:
+          CCS_AUTH_DISK_CACHE: '1'
+          CCS_RUST_CLIENT: '1'
+        run: |
+          npm install --prefix /tmp/ccs-rust-test-codex --no-audit --no-fund @openai/codex@0.162.1
+          export CCS_TEST_CODEX=$(find /tmp/ccs-rust-test-codex/node_modules -type f -path '*/vendor/*/bin/codex' -print -quit)
+          test -x "$CCS_TEST_CODEX"
+          export CCS_UNDER_TEST="$GITHUB_WORKSPACE/target/release/ccs"
+          mkdir -p contract-output
+          set -o pipefail
+          python3 crates/ccs/tests/cli_gate.py 2>&1 | tee contract-output/gate.txt
+          python3 tests/contract/run_rust.py 2>&1 | tee contract-output/rust.txt
+          python3 crates/ccs/tests/cli_oracle.py 2>&1 | tee contract-output/cli-oracle.txt
+          python3 crates/ccs/tests/cli_interop.py 2>&1 | tee contract-output/interop.txt
+      - name: Save Rust contract results including skips
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rust-cli-contract
+          path: contract-output/
+          if-no-files-found: error
   dependency-policy:
     runs-on: ubuntu-22.04
     steps:

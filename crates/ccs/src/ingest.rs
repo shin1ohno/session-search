@@ -854,7 +854,13 @@ impl Shipper {
                     continue;
                 };
                 if !util::valid_tool_result_name(name) {
-                    util::log("WARN", "ingest: tool-results name invalid; not sent");
+                    util::log(
+                        "WARN",
+                        &format!(
+                            "ingest: tool-results name {} does not match ^[A-Za-z0-9_][A-Za-z0-9._-]{{0,127}}$; not sent",
+                            crate::resume::repr(&string(name.chars().take(80).collect::<String>()))
+                        ),
+                    );
                     continue;
                 }
                 let Ok(mut file) =
