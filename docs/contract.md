@@ -260,6 +260,17 @@ for an invalid certificate bundle. Endpoint/auth/client/token URL changes rebuil
 the pool. Search/preview response bodies are limited to 4 MiB, and at most 32
 helper callback/fuse workers run concurrently.
 
+The Rust disk-cache fallback warning contains only a static operation name
+(`directory`, `lock`, `read` or `save`), the raw numeric errno (or `None`), and
+the `std::io::ErrorKind` name. It never includes the error's Display text, a
+path, a credential, a bearer or a bearer digest. The warning is emitted at most
+once per process; cache safety checks and the fallback policy still apply.
+
+While ccs runs, the core-dump soft limit is zero and the inherited hard limit is
+preserved. Immediately before replacing itself with an agent, ccs restores the
+soft limit it inherited at startup. If exec fails, ccs disables core dumps again
+before handling the error or trying the next PATH entry.
+
 ### D12: surrogateescaped stdout
 
 Rust writes a surrogateescaped code point on stdout as its original byte in every
