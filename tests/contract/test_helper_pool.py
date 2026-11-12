@@ -442,7 +442,6 @@ class HelperPool(HelperBase):
         self.assertIn(b'OFFLINE', result.stdout, 'unbounded helper response accepted')
         self.assertLess(len(result.stdout), 10000)
 
-    @unittest.skipUnless(os.path.exists('/proc/self/status'), 'Linux thread observation required')
     def test_helper_worker_count_is_bounded(self):
         self.start_picker()
         sockets = []
@@ -457,9 +456,19 @@ class HelperPool(HelperBase):
                     pass
                 sockets.append(stream)
             time.sleep(.2)
-            status = Path('/proc/%d/status' % self.proc.pid).read_text()
-            threads = int(next(line.split()[1] for line in status.splitlines() if line.startswith('Threads:')))
-            self.assertLessEqual(threads, 36, 'helper spawned an unbounded worker per connection')
+            # The receiver must reject excess connections without allocating workers.
+            rejected = 0
+            for stream in sockets[32:]:
+                stream.settimeout(.05)
+                try:
+                    rejected += b'503 Service Unavailable' in stream.recv(4096)
+                except (TimeoutError, ConnectionResetError):
+                    pass
+            self.assertGreaterEqual(rejected, 28, 'helper accepted excess workers')
+            if os.path.exists('/proc/self/status'):
+                status = Path('/proc/%d/status' % self.proc.pid).read_text()
+                threads = int(next(line.split()[1] for line in status.splitlines() if line.startswith('Threads:')))
+                self.assertLessEqual(threads, 36, 'helper spawned an unbounded worker per connection')
         finally:
             for stream in sockets:
                 stream.close()

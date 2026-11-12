@@ -28,10 +28,15 @@ fn guarded(body: impl FnOnce() -> ExitCode + std::panic::UnwindSafe) -> ExitCode
     std::panic::set_hook(Box::new(|_| ccs::cli::stderr_line("ccs: internal error")));
     // Set before dispatch can read credentials; core dumps can contain secrets.
     unsafe {
-        let limit = libc::rlimit {
+        let mut limit = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
         };
+        if libc::getrlimit(libc::RLIMIT_CORE, &mut limit) != 0 {
+            ccs::cli::stderr_line("ccs: cannot read core dump limit");
+            return ExitCode::from(1);
+        }
+        limit.rlim_cur = 0;
         if libc::setrlimit(libc::RLIMIT_CORE, &limit) != 0 {
             ccs::cli::stderr_line("ccs: cannot disable core dumps");
             return ExitCode::from(1);

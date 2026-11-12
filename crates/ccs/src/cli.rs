@@ -2,6 +2,7 @@
 use crate::api::Api;
 use crate::config::Config;
 use crate::errors::{Error, ExitStatus, Result};
+use crate::query::Query;
 use crate::util::{self, get, number, object, set, string, text, truthy};
 use ccs_pytext::json::Value;
 use clap::builder::TypedValueParser;
@@ -29,7 +30,12 @@ fn picker_command(structured: bool) -> Command {
                 .long("version")
                 .action(ArgAction::Version),
         )
-        .arg(Arg::new("query").num_args(0..).action(ArgAction::Append))
+        .arg(
+            Arg::new("query")
+                .value_parser(clap::builder::OsStringValueParser::new())
+                .num_args(0..)
+                .action(ArgAction::Append),
+        )
         .args([
             flag("deep"),
             flag("semantic"),
@@ -55,9 +61,11 @@ fn picker_command(structured: bool) -> Command {
 fn subcommand(name: &'static str) -> Command {
     let cmd = command(name);
     match name {
-        "preview" => cmd
-            .arg(Arg::new("session_key").required(true))
-            .arg(Arg::new("query").default_value("")),
+        "preview" => cmd.arg(Arg::new("session_key").required(true)).arg(
+            Arg::new("query")
+                .value_parser(clap::builder::OsStringValueParser::new())
+                .default_value(""),
+        ),
         "resume" => cmd
             .arg(Arg::new("session_key").required(true))
             .args([flag("print"), flag("fork"), flag("force")])
@@ -84,18 +92,26 @@ fn subcommand(name: &'static str) -> Command {
                     .required(true),
             ),
         "purge" => cmd.arg(Arg::new("session_key").required(true)),
-        "_backend" => cmd.arg(Arg::new("q").default_value("")),
-        "_preview" => cmd
-            .arg(Arg::new("key").required(true))
-            .arg(Arg::new("q").default_value("")),
+        "_backend" => cmd.arg(
+            Arg::new("q")
+                .value_parser(clap::builder::OsStringValueParser::new())
+                .default_value(""),
+        ),
+        "_preview" => cmd.arg(Arg::new("key").required(true)).arg(
+            Arg::new("q")
+                .value_parser(clap::builder::OsStringValueParser::new())
+                .default_value(""),
+        ),
         "_toggle" => cmd.arg(
             Arg::new("letter")
                 .required(true)
                 .value_parser(["s", "d", "a"]),
         ),
-        "_fuse" => cmd
-            .arg(Arg::new("seq").required(true))
-            .arg(Arg::new("q").default_value("")),
+        "_fuse" => cmd.arg(Arg::new("seq").required(true)).arg(
+            Arg::new("q")
+                .value_parser(clap::builder::OsStringValueParser::new())
+                .default_value(""),
+        ),
         "completion" => cmd.arg(Arg::new("shell").required(true).value_parser(["zsh"])),
         _ => cmd,
     }
@@ -155,11 +171,11 @@ fn options(matches: &ArgMatches) -> Result<(String, Value)> {
     let since = arg(matches, "since");
     if !since.is_empty() {
         let seconds = util::parse_duration(since)?;
-        set(
-            &mut opts,
-            "since",
-            string(util::iso(util::now_epoch() - seconds as f64)),
-        );
+        let epoch = util::now_epoch() - seconds as f64;
+        if epoch < -62135596800.0 {
+            return Err(util::invalid("date precedes year one"));
+        }
+        set(&mut opts, "since", string(util::iso(epoch)));
     }
     Ok((flags, opts))
 }
@@ -198,14 +214,17 @@ fn unavailable(error: Error) -> Error {
         other => other,
     }
 }
-fn with_agent(mut value: Value) -> Value {
+fn with_agent(mut value: Value) -> Result<Value> {
+    if !matches!(value, Value::Object(_)) {
+        return Err(util::invalid("invalid session mapping"));
+    }
     let codex = text(get(&value, "entrypoint")).is_some_and(|s| s.starts_with("codex-"));
     set(
         &mut value,
         "agent",
         string(if codex { "codex" } else { "claude" }),
     );
-    value
+    Ok(value)
 }
 fn response_object(response: crate::api::Response, route: &str) -> Result<Value> {
     match response.json() {
@@ -216,13 +235,13 @@ fn response_object(response: crate::api::Response, route: &str) -> Result<Value>
         ))),
     }
 }
-fn search(matches: &ArgMatches, query: &str, flags: &str, opts: &Value) -> Result<ExitStatus> {
+fn search(matches: &ArgMatches, query: &Query, flags: &str, opts: &Value) -> Result<ExitStatus> {
     let limit = *matches.get_one::<i64>("limit").unwrap() as usize;
-    let current = util::current_session_id();
+    let current = util::current_session_id().filter(|id| !id.is_empty());
     let data = if matches.get_flag("offline") {
         let cfg = Config::load(None).ok();
         let host = crate::picker::host_label(cfg.as_ref());
-        let found = crate::picker::local_search(query, flags, opts, current.as_deref())?;
+        let found = crate::picker::local_search_query(query, flags, opts, current.as_deref())?;
         let found = if crate::picker::host_selected(opts, &host) {
             found
         } else {
@@ -258,7 +277,10 @@ fn search(matches: &ArgMatches, query: &str, flags: &str, opts: &Value) -> Resul
         ])
     } else {
         let cfg = Config::load(None).map_err(unavailable)?;
-        let mut body = crate::picker::search_body(query, flags, opts, None);
+        if query.trimmed().points().len() >= 2 && query.utf8().is_none() {
+            return Err(util::invalid("invalid UTF-8 query"));
+        }
+        let mut body = crate::picker::search_body_query(query, flags, opts, None);
         set(
             &mut body,
             "limit",
@@ -281,7 +303,7 @@ fn search(matches: &ArgMatches, query: &str, flags: &str, opts: &Value) -> Resul
                 .take(limit)
                 .cloned()
                 .map(with_agent)
-                .collect(),
+                .collect::<Result<Vec<_>>>()?,
             Value::Null if !util::has(&data, "sessions") => vec![],
             _ => return Err(util::invalid("invalid sessions")),
         };
@@ -344,7 +366,7 @@ fn preview(key: &str, query: &str) -> Result<ExitStatus> {
         } else {
             object(Vec::<(&str, Value)>::new())
         };
-        set(&mut data, "session", with_agent(session));
+        set(&mut data, "session", with_agent(session)?);
         data
     };
     json_output(&data, false, false)?;
@@ -361,7 +383,10 @@ fn purge(key: &str) -> Result<ExitStatus> {
             false,
             None,
         )
-        .map_err(|e| Error::Unavailable(format!("server unreachable: {}", message(&e))))?;
+        .map_err(|e| match e {
+            error if crate::token::is_credential_error(&error) => error,
+            other => Error::Unavailable(format!("server unreachable: {}", message(&other))),
+        })?;
     if response.status != 200 {
         return Err(Error::Unavailable(format!(
             "purge answered HTTP {}",
@@ -595,6 +620,13 @@ fn normalize_arguments(
     for (i, value) in rest.iter().enumerate() {
         let raw = value.to_str().unwrap_or("");
         let is_negative = negative.is_match(&normalize_decimal_digits(raw));
+        let known_equals_option = raw.split_once('=').is_some_and(|(name, _)| {
+            parser.get_arguments().any(|a| {
+                a.get_long()
+                    .is_some_and(|long| long.starts_with(name.trim_start_matches('-')))
+            })
+        });
+        let spaced_positional = raw.starts_with('-') && raw.contains(' ') && !known_equals_option;
         if !escaped && raw == "--" && !takes_value {
             escaped = true;
             normalized.push(value.clone());
@@ -602,7 +634,12 @@ fn normalize_arguments(
         }
         if takes_value {
             takes_value = false;
-        } else if !escaped && raw.starts_with('-') && raw != "-" && !is_negative {
+        } else if !escaped
+            && raw.starts_with('-')
+            && raw != "-"
+            && !is_negative
+            && !spaced_positional
+        {
             if positional {
                 ended = true;
             }
@@ -622,7 +659,7 @@ fn normalize_arguments(
             }
             positional = true;
         }
-        if !escaped && is_negative {
+        if !escaped && (is_negative || spaced_positional) {
             let mut marker = format!("ccs-negative-argument-{i}");
             while rest.iter().any(|s| s == marker.as_str()) {
                 marker.push('_');
@@ -646,6 +683,14 @@ fn normalize_arguments(
                 "limit" => a.value_parser(move |s: &str| {
                     parse_limit(map.get(s).map(String::as_str).unwrap_or(s))
                 }),
+                "query" | "q" => {
+                    a.value_parser(clap::builder::OsStringValueParser::new().map(move |s| {
+                        s.to_str()
+                            .and_then(|v| map.get(v))
+                            .map(OsString::from)
+                            .unwrap_or(s)
+                    }))
+                }
                 "file" | "to" => {
                     a.value_parser(clap::builder::OsStringValueParser::new().map(move |s| {
                         PathBuf::from(
@@ -694,14 +739,20 @@ pub fn dispatch(args: &[OsString]) -> Result<ExitStatus> {
     match name {
         "pick" | "search" => {
             let (flags, opts) = options(&matches)?;
-            let query = matches
-                .get_many::<String>("query")
-                .map(|v| v.cloned().collect::<Vec<_>>().join(" "))
-                .unwrap_or_default();
+            let mut joined = OsString::new();
+            if let Some(values) = matches.get_many::<OsString>("query") {
+                for (i, value) in values.enumerate() {
+                    if i > 0 {
+                        joined.push(" ");
+                    }
+                    joined.push(value);
+                }
+            }
+            let query = Query::from_os(&joined);
             if name == "search" {
                 search(&matches, &query, &flags, &opts)
             } else {
-                crate::picker::pick(
+                crate::picker::pick_query(
                     &query,
                     &flags,
                     &opts,
@@ -710,7 +761,15 @@ pub fn dispatch(args: &[OsString]) -> Result<ExitStatus> {
                 )
             }
         }
-        "preview" => preview(arg(&matches, "session_key"), arg(&matches, "query")),
+        "preview" => {
+            let query = Query::from_os(matches.get_one::<OsString>("query").unwrap());
+            preview(
+                arg(&matches, "session_key"),
+                &query
+                    .utf8()
+                    .ok_or_else(|| util::invalid("invalid URL query"))?,
+            )
+        }
         "purge" => purge(arg(&matches, "session_key")),
         "status" => status(),
         "resume" => resume_dispatch(
@@ -737,26 +796,41 @@ pub fn dispatch(args: &[OsString]) -> Result<ExitStatus> {
         }
         _ => {
             let env = crate::picker::environment();
+            let query = matches
+                .try_get_one::<OsString>("q")
+                .ok()
+                .flatten()
+                .map(|q| Query::from_os(q))
+                .unwrap_or_else(|| Query::from(""));
+            let utf8_query = query.utf8();
             let params = match name {
-                "_backend" => vec![("q", arg(&matches, "q"))],
-                "_preview" => vec![("key", arg(&matches, "key")), ("q", arg(&matches, "q"))],
+                "_backend" => vec![("q", utf8_query.as_deref().unwrap_or(""))],
+                "_preview" => vec![
+                    ("key", arg(&matches, "key")),
+                    ("q", utf8_query.as_deref().unwrap_or("")),
+                ],
                 "_toggle" => vec![("letter", arg(&matches, "letter"))],
                 _ => vec![],
             };
-            if name != "_fuse" {
+            if name != "_fuse" && utf8_query.is_some() {
                 if let Some(reply) = crate::helper::callback(name, &params, &env) {
                     output(&reply)?;
                     return Ok(ExitStatus::Success);
                 }
             }
             let reply = match name {
-                "_backend" => crate::picker::backend(arg(&matches, "q"), &env, None)?,
-                "_preview" => {
-                    crate::picker::preview(arg(&matches, "key"), arg(&matches, "q"), &env, None)?
-                }
+                "_backend" => crate::picker::backend_query(&query, &env, None)?,
+                "_preview" => crate::picker::preview(
+                    arg(&matches, "key"),
+                    utf8_query
+                        .as_deref()
+                        .ok_or_else(|| util::invalid("invalid URL query"))?,
+                    &env,
+                    None,
+                )?,
                 "_toggle" => crate::picker::toggle(arg(&matches, "letter"), &env)? + "\n",
                 "_fuse" => {
-                    crate::picker::fuse(arg(&matches, "seq"), arg(&matches, "q"), &env, None)?;
+                    crate::picker::fuse_query(arg(&matches, "seq"), &query, &env, None)?;
                     String::new()
                 }
                 _ => unreachable!(),

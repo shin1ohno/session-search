@@ -76,6 +76,38 @@ jobs:
           name: rust-cli-contract
           path: contract-output/
           if-no-files-found: error
+  rust-macos:
+    runs-on: macos-15
+    env:
+      CCS_BUILD_COMMIT: ${{ github.sha }}
+      CCS_AUTH_DISK_CACHE: '1'
+      CCS_RUST_CLIENT: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.13.5'
+      - run: rustup toolchain install 1.99.1 --profile minimal
+      - run: cargo build --locked --release --bin ccs
+      - name: Install local search and native Codex
+        run: |
+          command -v rg || brew install ripgrep
+          npm install --prefix "$RUNNER_TEMP/ccs-test-codex" --no-audit --no-fund @openai/codex@0.162.1
+      - name: Rust CLI contracts on macOS
+        run: |
+          export CCS_TEST_CODEX=$(find "$RUNNER_TEMP/ccs-test-codex/node_modules" -type f -path '*/vendor/*/bin/codex' -print -quit)
+          test -x "$CCS_TEST_CODEX"
+          export CCS_UNDER_TEST="$GITHUB_WORKSPACE/target/release/ccs"
+          mkdir -p contract-output
+          set -o pipefail
+          python3 tests/contract/run_rust.py 2>&1 | tee contract-output/macos.txt
+      - name: Save macOS contracts including skips
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rust-macos-contract
+          path: contract-output/
+          if-no-files-found: error
   dependency-policy:
     runs-on: ubuntu-22.04
     steps:

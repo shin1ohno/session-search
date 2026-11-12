@@ -186,8 +186,10 @@ class ProcessBoundary(ClientCase):
         finally:
             os.close(writer)
 
-    @unittest.skipUnless(sys.platform == "linux", "procfs core-limit observation requires Linux")
     def test_core_dumps_disabled_before_credential_acquisition(self):
+        if sys.platform != "linux":
+            from .test_cli_review import RustReview
+            return RustReview.test_resume_preserves_hard_core_limit(self)
         import threading
         entered, release = threading.Event(), threading.Event()
         def handler(req):
@@ -217,7 +219,9 @@ class ProcessBoundary(ClientCase):
         try:
             self.assertTrue(entered.wait(5), "token endpoint was not reached")
             limit = next(line for line in Path("/proc/%d/limits" % process.pid).read_text().splitlines() if line.startswith("Max core file size"))
-            self.assertEqual(limit.split()[4:6], ["0", "0"], "credential-reading process can dump its memory")
+            self.assertEqual(limit.split()[4], "0", "credential-reading process can dump its memory")
+            hard = resource.getrlimit(resource.RLIMIT_CORE)[1]
+            self.assertEqual(limit.split()[5], "unlimited" if hard < 0 else str(hard))
         finally:
             release.set()
             output, error = process.communicate(timeout=10)

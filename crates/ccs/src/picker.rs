@@ -4,9 +4,10 @@ use crate::breaker::{Breaker, TIMEOUT};
 use crate::config::Config;
 use crate::errors::{Error, ExitStatus, Result};
 use crate::helper::SharedApi;
+use crate::query::Query;
 use crate::util::{self, get, object, set, string, text, truthy};
 use ccs_pytext::json::Value;
-use ccs_pytext::{casefold, shell_quote, split, strip};
+use ccs_pytext::{casefold, shell_quote, split};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
@@ -137,7 +138,7 @@ pub fn fzf_argv(
         ),
         None => shell_quote(self_cmd),
     };
-    let backend = format!("reload({s} _backend {{q}})");
+    let backend = format!("reload({s} _backend -- {{q}})");
     let mut argv: Vec<String> = [
         "--disabled",
         "--ansi",
@@ -166,7 +167,7 @@ pub fn fzf_argv(
     }
     argv.extend([
         "--preview".into(),
-        format!("{s} _preview {{1}} {{q}}"),
+        format!("{s} _preview -- {{1}} {{q}}"),
         "--preview-window".into(),
         "down,45%,wrap".into(),
         "--expect=ctrl-y".into(),
@@ -284,9 +285,19 @@ pub fn host_label(cfg: Option<&Config>) -> String {
     }
 }
 pub fn search_body(q: &str, flags: &str, opts: &Value, mode: Option<&str>) -> Value {
-    let q = strip(q);
+    search_body_query(&Query::from(q), flags, opts, mode)
+}
+pub fn search_body_query(q: &Query, flags: &str, opts: &Value, mode: Option<&str>) -> Value {
+    let q = q.trimmed();
     let mut body = object([
-        ("q", string(if q.chars().count() >= 2 { q } else { "" })),
+        (
+            "q",
+            Value::String(if q.points().len() >= 2 {
+                q.points().to_vec()
+            } else {
+                vec![]
+            }),
+        ),
         (
             "mode",
             string(mode.unwrap_or(if flags.contains('s') {
@@ -316,8 +327,16 @@ pub fn local_search(
     opts: &Value,
     current: Option<&str>,
 ) -> Result<Vec<crate::extract::LocalSession>> {
+    local_search_query(&Query::from(q), flags, opts, current)
+}
+pub fn local_search_query(
+    q: &Query,
+    flags: &str,
+    opts: &Value,
+    current: Option<&str>,
+) -> Result<Vec<crate::extract::LocalSession>> {
     let cwd = text(get(opts, "cwd_prefix"));
-    crate::fallback::search_options(
+    crate::fallback::search_options_query(
         q,
         &crate::fallback::SearchOptions {
             include_headless: flags.contains('a'),
@@ -335,7 +354,7 @@ pub fn host_selected(opts: &Value, host: &str) -> bool {
     }
 }
 fn offline_rows(
-    q: &str,
+    q: &Query,
     flags: &str,
     opts: &Value,
     host: &str,
@@ -348,7 +367,7 @@ fn offline_rows(
         ));
         return Ok(rows);
     }
-    match local_search(q, flags, opts, current_id(env)) {
+    match local_search_query(q, flags, opts, current_id(env)) {
         Ok(found) => rows.extend(found.iter().map(|s| local_row(s, host))),
         Err(Error::Unavailable(s)) => rows.push(banner_row(&s)),
         Err(e) => return Err(e),
@@ -371,7 +390,7 @@ fn api_request(
     }
 }
 struct Search<'a> {
-    q: &'a str,
+    q: &'a Query,
     flags: &'a str,
     opts: &'a Value,
     env: &'a Environment,
@@ -383,7 +402,10 @@ fn server_rows(
     shared: Option<&Arc<SharedApi>>,
     request: Search<'_>,
 ) -> Result<Vec<String>> {
-    let body = search_body(request.q, request.flags, request.opts, request.mode);
+    if request.q.trimmed().points().len() >= 2 && request.q.utf8().is_none() {
+        return Err(util::invalid("invalid UTF-8 query"));
+    }
+    let body = search_body_query(request.q, request.flags, request.opts, request.mode);
     let resp = api_request(
         cfg,
         shared,
@@ -423,6 +445,13 @@ fn server_rows(
     Ok(rows)
 }
 pub fn backend(q: &str, env: &Environment, shared: Option<&Arc<SharedApi>>) -> Result<String> {
+    backend_query(&Query::from(q), env, shared)
+}
+pub fn backend_query(
+    q: &Query,
+    env: &Environment,
+    shared: Option<&Arc<SharedApi>>,
+) -> Result<String> {
     let flags = current_flags(env)?;
     let opts = pick_opts(env);
     let cfg = Config::load(None).ok();
@@ -490,7 +519,7 @@ fn random_hex() -> Result<String> {
         .map_err(|_| util::invalid("random generator failed"))?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
-fn schedule_fuse(q: &str, env: &Environment, shared: Option<&Arc<SharedApi>>) -> Result<()> {
+fn schedule_fuse(q: &Query, env: &Environment, shared: Option<&Arc<SharedApi>>) -> Result<()> {
     let seq = format!("{}-{}", util::now_epoch(), random_hex()?);
     util::atomic_write(&cache_path(env, "seq"), &seq, 0o600)?;
     if let Some(shared) = shared {
@@ -502,11 +531,12 @@ fn schedule_fuse(q: &str, env: &Environment, shared: Option<&Arc<SharedApi>>) ->
         let q = q.to_owned();
         std::thread::spawn(move || {
             let _permit = permit;
-            let _ = fuse(&seq, &q, &env, Some(&shared));
+            let _ = fuse_query(&seq, &q, &env, Some(&shared));
         });
     } else {
         let mut cmd = Command::new(launcher());
-        cmd.args(["_fuse", &seq, q])
+        cmd.args(["_fuse", &seq, "--"])
+            .arg(q.os_string())
             .envs(env)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -529,6 +559,14 @@ fn schedule_fuse(q: &str, env: &Environment, shared: Option<&Arc<SharedApi>>) ->
     Ok(())
 }
 pub fn fuse(seq: &str, q: &str, env: &Environment, shared: Option<&Arc<SharedApi>>) -> Result<()> {
+    fuse_query(seq, &Query::from(q), env, shared)
+}
+pub fn fuse_query(
+    seq: &str,
+    q: &Query,
+    env: &Environment,
+    shared: Option<&Arc<SharedApi>>,
+) -> Result<()> {
     std::thread::sleep(Duration::from_millis(400));
     let path = cache_path(env, "seq");
     if fs::read_to_string(&path).ok().as_deref() != Some(seq) {
@@ -649,6 +687,9 @@ pub fn preview(
         Duration::from_millis(1500),
     ) {
         Ok(resp) => resp,
+        Err(error) if crate::token::is_credential_error(&error) => {
+            return Err(util::invalid("client secret unreadable"))
+        }
         Err(e) => {
             breaker.record_failure()?;
             return Ok(format!("server unreachable: {}\n", crate::cli::message(&e)));
@@ -777,6 +818,15 @@ impl Drop for Signals {
     }
 }
 pub fn pick(query: &str, flags: &str, opts: &Value, print: bool, fork: bool) -> Result<ExitStatus> {
+    pick_query(&Query::from(query), flags, opts, print, fork)
+}
+pub fn pick_query(
+    query: &Query,
+    flags: &str,
+    opts: &Value,
+    print: bool,
+    fork: bool,
+) -> Result<ExitStatus> {
     if !executable("fzf") {
         return Err(Error::Unavailable(
             "fzf is not installed; the picker needs it (ccs resume KEY still works)".into(),
@@ -812,12 +862,15 @@ pub fn pick(query: &str, flags: &str, opts: &Value, print: bool, fork: bool) -> 
         env.remove("CCS_HELPER_SOCKET");
     }
     let args = fzf_argv(
-        query,
+        &query.utf8().unwrap_or_default(),
         flags,
         env_value(&env, "CCS_LAUNCHER"),
         truthy(get(opts, "offline")).then_some(crate::fallback::BANNER),
         env.get("CCS_HELPER_SOCKET").map(String::as_str),
     );
+    let mut args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+    let query_index = args.iter().position(|a| a == "--query").unwrap() + 1;
+    args[query_index] = query.os_string();
     let mut child = Command::new("fzf")
         .args(args)
         .envs(&env)

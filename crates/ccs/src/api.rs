@@ -9,6 +9,7 @@ use std::time::Duration;
 use ureq::AsSendBody;
 
 pub const USER_AGENT: &str = concat!("ccs/", env!("CARGO_PKG_VERSION"));
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Response {
     pub status: u16,
@@ -46,7 +47,7 @@ struct BodyReadOptions {
 
 impl Api {
     pub fn new(config: Config) -> Self {
-        Self::with_timeout(config, Duration::from_secs(30))
+        Self::with_timeout(config, DEFAULT_TIMEOUT)
     }
     pub fn with_timeout(config: Config, timeout: Duration) -> Self {
         let agent = agent_configuration(None, None).new_agent();
@@ -523,6 +524,12 @@ fn recover_lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> 
 fn rejected(hash: &[u8; 32]) -> bool {
     recover_lock(rejected_bearers()).contains(hash)
 }
+pub(crate) fn bearer_rejected(value: &str) -> bool {
+    rejected(&bearer_digest(value))
+}
+pub(crate) fn remember_rejected(value: &str) {
+    recover_lock(rejected_bearers()).insert(bearer_digest(value));
+}
 #[derive(Default)]
 struct PoolTokens {
     manager: TokenManager,
@@ -532,9 +539,13 @@ struct FlightState {
     available: Option<PoolTokens>,
     failed_until: Option<std::time::Instant>,
 }
+#[cfg(test)]
+type AcquireHook = Box<dyn FnOnce(&str) + Send>;
 struct TokenFlight {
     state: std::sync::Mutex<FlightState>,
     changed: std::sync::Condvar,
+    #[cfg(test)]
+    after_acquire: std::sync::Mutex<Option<AcquireHook>>,
 }
 impl Default for TokenFlight {
     fn default() -> Self {
@@ -544,6 +555,8 @@ impl Default for TokenFlight {
                 failed_until: None,
             }),
             changed: std::sync::Condvar::new(),
+            #[cfg(test)]
+            after_acquire: std::sync::Mutex::new(None),
         }
     }
 }
@@ -581,12 +594,7 @@ impl TokenFlight {
                             let value = tokens
                                 .manager
                                 .acquire(&config, fresh, |credential| {
-                                    let remaining = deadline
-                                        .saturating_duration_since(std::time::Instant::now());
-                                    if remaining.is_zero() {
-                                        return Err(token_failure());
-                                    }
-                                    fetch_token(&agent, &config, credential, remaining)
+                                    fetch_token(&agent, &config, credential, DEFAULT_TIMEOUT)
                                 })?
                                 .value()
                                 .to_owned();
@@ -620,6 +628,10 @@ impl TokenFlight {
                 let result = receiver
                     .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
                     .map_err(|_| token_failure())??;
+                #[cfg(test)]
+                if let Some(hook) = recover_lock(&self.after_acquire).take() {
+                    hook(&result);
+                }
                 // Acquisition linearizes here. In-flight sends acquired before
                 // rejection may complete, but no later acquisition returns it.
                 if !rejected(&bearer_digest(&result)) {
@@ -726,7 +738,7 @@ impl PooledApi {
             };
             if response.status == 401 {
                 if let Some(bearer) = bearer {
-                    recover_lock(rejected_bearers()).insert(bearer_digest(&bearer));
+                    TokenManager::reject_sent(config, &bearer);
                     if !auth_retry {
                         auth_retry = true;
                         continue;
@@ -909,6 +921,73 @@ fn observe_disconnect<T>(result: &std::result::Result<T, ureq::Error>) {
 #[cfg(test)]
 mod pooled_lock_tests {
     use super::*;
+
+    #[test]
+    fn rejection_between_grant_and_waiter_handoff_cannot_escape() {
+        use std::io::BufRead;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "ccs-flight-{}-{}",
+            std::process::id(),
+            crate::util::now_epoch()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let secret = dir.join("secret");
+        std::fs::write(&secret, "synthetic-flight-secret").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for i in 1..=2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let body =
+                    format!("{{\"access_token\":\"synthetic-handoff-{i}\",\"expires_in\":0}}");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let config = Config {
+            path: dir.join("config.json"),
+            endpoint: endpoint.clone(),
+            host_label: "test".into(),
+            auth_type: "client_credentials".into(),
+            token_url: endpoint,
+            client_id: "test".into(),
+            secret_file: secret,
+            audience: String::new(),
+            hmac_key_file: dir.join("unused"),
+        };
+        let flight = std::sync::Arc::new(TokenFlight::default());
+        *recover_lock(&flight.after_acquire) = Some(Box::new(remember_rejected));
+        let token = flight
+            .acquire(
+                &config,
+                &agent_configuration(None, None).new_agent(),
+                std::time::Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(
+            token, "synthetic-handoff-2",
+            "waiter returned a bearer rejected after the worker finished"
+        );
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn poisoned_coordination_preserves_available_manager_and_rejections() {

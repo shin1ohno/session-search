@@ -157,3 +157,47 @@ class AuthReviewContract(test_auth.AuthContract):
         handler.do_GET = slow_get
         self.assert_clean(self.good("status", timeout=12))
         self.assertEqual(len(self.server.of("/status")), 1)
+
+
+from .harness import ClientCase, user
+
+
+class SecretErrors(ClientCase):
+    def check_secret(self, missing):
+        test_auth.AuthContract.setup_auth(self)
+        secret = self.cdir / "client.secret"
+        if missing:
+            secret.unlink()
+        else:
+            secret.chmod(0)
+            self.addCleanup(secret.chmod, 0o600)
+        transcript = self.transcript([user("hello")])
+        dest = Path(self.tmp) / "dest"
+        dest.mkdir()
+        cases = [(("search", "words"), 3), (("preview", "remote"), 3),
+                 (("purge", "remote"), 3), (("ingest", "--file", transcript, "--quiet"), 3),
+                 (("resume", "remote", "--to", str(dest), "--force", "--print"), 1),
+                 (("_backend", "words"), 0), (("_preview", "remote", "words"), 1)]
+        for args, code in cases:
+            with self.subTest(command=args[0], missing=missing):
+                self.breaker_path.unlink(missing_ok=True)
+                result = self.run_ccs(*args)
+                self.assertEqual(result.returncode, code, result.stderr)
+                expected = "-\t\x1b[33mOFFLINE — local sessions only, ≤200 newest candidates per agent\x1b[0m\n" if args[0] == "_backend" else ""
+                self.assertEqual(result.stdout, expected)
+                if args[0] in ("ingest", "_backend"):
+                    self.assertEqual(result.stderr, "")
+                else:
+                    if os.environ.get("CCS_RUST_CLIENT") == "1":
+                        self.assertEqual(result.stderr, "ccs: internal error\n" if code == 1 else "ccs: client secret unreadable or empty\n")
+                        self.assertEqual(len(result.stderr.splitlines()), 1)
+                    else:
+                        self.assertIn("client secret unreadable", result.stderr)
+                        self.assertIn("FileNotFoundError" if missing else "PermissionError", result.stderr)
+                self.assertEqual(self.server.requests, [], "credentials failure reached the API or token endpoint")
+
+    def test_missing_secret_on_every_token_route(self):
+        self.check_secret(True)
+
+    def test_unreadable_secret_on_every_token_route(self):
+        self.check_secret(False)

@@ -259,3 +259,10 @@ requests clone the agent's cached certificate configuration; HTTP does not fail
 for an invalid certificate bundle. Endpoint/auth/client/token URL changes rebuild
 the pool. Search/preview response bodies are limited to 4 MiB, and at most 32
 helper callback/fuse workers run concurrently.
+
+### D12: surrogateescaped stdout
+
+Rust writes a surrogateescaped code point on stdout as its original byte in every
+locale. Python does so under C, POSIX and C.UTF-8, but raises UnicodeEncodeError
+under en_US.UTF-8. The Python contract harness pins LANG=C.UTF-8 and removes
+LC_ALL and LC_CTYPE so the oracle does not depend on the host locale.

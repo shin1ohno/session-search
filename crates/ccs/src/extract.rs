@@ -360,6 +360,23 @@ fn scan_records(
     keep_last: usize,
     records: impl IntoIterator<Item = Value>,
 ) -> LocalSession {
+    let query: Vec<_> = query.unwrap_or("").chars().map(u32::from).collect();
+    scan_records_points(path, &query, keep_last, records)
+}
+pub fn scan_checked_points(path: &Path, query: &[u32], keep_last: usize) -> Result<LocalSession> {
+    let mut records = iter_records(path);
+    let session = scan_records_points(path, query, keep_last, &mut records);
+    match records.failure {
+        Some(error) => Err(error),
+        None => Ok(session),
+    }
+}
+fn scan_records_points(
+    path: &Path,
+    query: &[u32],
+    keep_last: usize,
+    records: impl IntoIterator<Item = Value>,
+) -> LocalSession {
     let native = codex::is_path(path);
     let mut s = LocalSession {
         path: path.to_owned(),
@@ -388,10 +405,7 @@ fn scan_records(
         mtime: mtime(path),
         source: LocalText::default(),
     };
-    let query: Vec<u32> = ccs_pytext::casefold(query.unwrap_or(""))
-        .chars()
-        .map(u32::from)
-        .collect();
+    let query = ccs_pytext::casefold_points(query);
     let mut titles = [None, None, None];
     let mut first = None;
     for rec in records {

@@ -92,6 +92,9 @@ impl Helper {
             while !done.load(Ordering::Relaxed) {
                 match socket.accept() {
                     Ok((mut stream, _)) => {
+                        if stream.set_nonblocking(false).is_err() {
+                            continue;
+                        }
                         let Some(permit) = api.worker() else {
                             let _ = stream.set_write_timeout(Some(Duration::from_millis(10)));
                             let _ = reply(&mut stream, 503, "helper busy\n");

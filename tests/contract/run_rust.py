@@ -11,7 +11,8 @@ ROOT = Path(__file__).resolve().parents[2]
 def forbidden_skip(test_id):
     return (".test_auth" in test_id or test_id.startswith("contract.test_auth")
             or "test_helper_pool" in test_id or "ProcessBoundary" in test_id
-            or "test_helper_runs_without_curl" in test_id)
+            or "test_helper_runs_without_curl" in test_id
+            or "RustReview" in test_id or "RustHelperReview" in test_id)
 
 
 def main():

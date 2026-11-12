@@ -1170,6 +1170,9 @@ fn resume_inner(req: &ResumeRequest, diagnostics: &Diagnostics) -> Result<ExitSt
 pub fn resume(request: &ResumeRequest) -> Result<ExitStatus> {
     let diagnostics = Diagnostics::capture();
     match resume_inner(request, &diagnostics) {
+        Err(error) if crate::token::is_credential_error(&error) => {
+            Err(util::invalid("credential error"))
+        }
         Err(e @ (Error::ResumePrecondition(_) | Error::Unavailable(_))) => {
             if let Error::ResumePrecondition(message) | Error::Unavailable(message) = &e {
                 diagnostics.write(&format!("ccs: {message}"))?;

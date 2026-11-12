@@ -30,6 +30,8 @@ class HelperBase(ClientCase):
         self.srv = FakeServer(lambda req: (200, PREVIEW if req["path"].endswith("/preview") else SESSIONS, {}))
         self.addCleanup(self.srv.close)
         self.write_config(self.srv.base)
+        (Path(self.tmp) / ".config").chmod(0o700)
+        (Path(self.tmp) / ".config/session-search").chmod(0o700)
         self.env["CLAUDE_CODE_SESSION_ID"] = "me"
 
     def start_picker(self, prefix=(), env=None):
@@ -41,6 +43,8 @@ class HelperBase(ClientCase):
                   "(p / 'fzf-live.tmp').write_text(json.dumps(data))\n"
                   "(p / 'fzf-live.tmp').replace(p / 'fzf-live.json')\n"
                   "while not (p / 'fzf-release').exists(): time.sleep(0.01)\n"
+                  "s = p / 'fzf-select'\n"
+                  "if s.exists(): sys.stdout.write(s.read_text()); raise SystemExit(0)\n"
                   "raise SystemExit(130)\n")
         self.child_env = dict(self.env, **(env or {}))
         self.proc = subprocess.Popen(list(prefix) + self.command + ["query"], env=self.child_env, cwd=self.tmp,
@@ -142,9 +146,17 @@ class SameBytes(HelperBase):
 
     def test_query_text_round_trips(self):
         for query in ("it's", 'say "hi"', "マージ 認証", "a&b=c", "100% done", "  spaced  out ",
-                      "$HOME `id`", "x+y #frag ?q", "back\\slash"):
+                      "$HOME `id`", "x+y #frag ?q", "back\\slash", "-rf", "-x", "--force push"):
             self.assertEqual(self.invoke(self.backend_command(query)).returncode, 0)
             self.assertEqual(self.srv.of("/search")[-1]["body"]["q"], query.strip())
+
+    def test_leading_dash_preview_query(self):
+        for query in ("-rf", "-x", "--force push"):
+            command = self.argv[self.argv.index("--preview") + 1]
+            command = command.replace("{1}", shlex.quote("sk_2")).replace("{q}", shlex.quote(query))
+            result = self.invoke(command)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.srv.of("/preview")[-1]["query"]["q"], query)
 
     def test_helper_down_falls_back_to_the_process_command(self):
         self.assertIsNotNone(self.sock)
