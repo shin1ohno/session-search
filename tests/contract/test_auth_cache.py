@@ -135,6 +135,9 @@ class TokenCacheContract(test_auth.AuthContract):
             "states": [[line for line in result.stdout.splitlines() if line.startswith("token:")]
                        for result in results],
             "cache_warnings": ["token cache unavailable or unsafe" in result.stderr for result in results],
+            "cache_diagnostics": [[line for line in result.stderr.splitlines()
+                                   if line.startswith("ccs: token cache unavailable or unsafe;")]
+                                  for result in results],
             "cache_exists": self.cache.is_file(),
             "lock_inode": (self.cdir / "token.lock").stat().st_ino,
         }

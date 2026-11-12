@@ -49,12 +49,13 @@ fn hex(bytes: &[u8]) -> String {
 fn fingerprint(bytes: &[u8]) -> String {
     hex(digest::digest(&digest::SHA256, bytes).as_ref())
 }
-fn warn_cache() {
+fn warn_cache(operation: &'static str, error: &io::Error) {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
-        crate::util::stderr_line(
-            "ccs: token cache unavailable or unsafe; continuing without cache",
-        );
+        crate::util::stderr_line(&format!(
+            "ccs: token cache unavailable or unsafe; continuing without cache (operation={operation}, errno={:?}, kind={:?})",
+            error.raw_os_error(), error.kind(),
+        ));
     }
 }
 fn invalid() -> io::Error {
@@ -368,7 +369,7 @@ impl TokenManager {
                 }
             }
             let dir = Directory::open(config.path.parent().unwrap_or(Path::new(".")))
-                .inspect_err(|_| warn_cache())
+                .inspect_err(|error| warn_cache("directory", error))
                 .ok();
             if !fresh {
                 self.token = dir
@@ -382,7 +383,7 @@ impl TokenManager {
                 // never unlinked, including on process exit or lock timeout.
                 let lock = dir
                     .as_ref()
-                    .and_then(|d| d.lock().inspect_err(|_| warn_cache()).ok());
+                    .and_then(|d| d.lock().inspect_err(|error| warn_cache("lock", error)).ok());
                 if lock.is_some() {
                     if let Some(d) = &dir {
                         d.clean_orphans();
@@ -417,8 +418,8 @@ impl TokenManager {
                     }
                     if lock.is_some() {
                         if let Some(d) = &dir {
-                            if d.save(&token).is_err() {
-                                warn_cache();
+                            if let Err(error) = d.save(&token) {
+                                warn_cache("save", &error);
                             }
                         }
                     }
@@ -550,7 +551,7 @@ impl Directory {
             Ok(file) => file,
             Err(e) => {
                 if e.kind() != io::ErrorKind::NotFound {
-                    warn_cache();
+                    warn_cache("read", &e);
                 }
                 return None;
             }
