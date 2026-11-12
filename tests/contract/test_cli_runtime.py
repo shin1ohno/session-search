@@ -236,7 +236,6 @@ class ProcessBoundary(ClientCase):
 #include <sys/resource.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <dlfcn.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -245,8 +244,8 @@ static void observe(const char *path) {
     if (strcmp(base ? base + 1 : path, "client.secret")) return;
     struct rlimit limit;
     if (getrlimit(RLIMIT_CORE, &limit)) return;
-    int (*original)(const char *, int, ...) = dlsym(RTLD_NEXT, "open");
-    int fd = original(getenv("CCS_TEST_CORE_OBSERVED"), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    /* dyld exempts the interposing image's own references from replacement. */
+    int fd = open(getenv("CCS_TEST_CORE_OBSERVED"), O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) return;
     char result[] = "0 0\n";
     result[0] = limit.rlim_cur == 0 ? '1' : '0';
@@ -258,15 +257,13 @@ static int observed_open(const char *path, int flags, ...) {
     mode_t mode = 0;
     if (flags & O_CREAT) { va_list args; va_start(args, flags); mode = va_arg(args, int); va_end(args); }
     observe(path);
-    int (*original)(const char *, int, ...) = dlsym(RTLD_NEXT, "open");
-    return original(path, flags, mode);
+    return open(path, flags, mode);
 }
 static int observed_openat(int dir, const char *path, int flags, ...) {
     mode_t mode = 0;
     if (flags & O_CREAT) { va_list args; va_start(args, flags); mode = va_arg(args, int); va_end(args); }
     observe(path);
-    int (*original)(int, const char *, int, ...) = dlsym(RTLD_NEXT, "openat");
-    return original(dir, path, flags, mode);
+    return openat(dir, path, flags, mode);
 }
 #ifndef PROBE_MAIN
 __attribute__((used)) static struct { const void *replacement; const void *original; }
