@@ -149,12 +149,15 @@ fn magic(v: Value) -> Value {
         path=copy/'crates/ccs-pytext/src/json.rs'
         j=(ROOT/'crates/ccs-pytext/src/json.rs').read_text().replace('if integer % 2 == 1 {','if false {')
         path.write_text(j)
+    elif name=='HMAC-key32':
+        s=replace_once(s,'ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key)',
+            'ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key[..key.len().min(32)])')
     else: raise ValueError(name)
     assert s!=original or t!=tables or name in ('JSON-rounding','JSON-duplicate','JSON-power-two','JSON-slash','JSON-low-surrogate'),name
     return s,t
 
 controls=a.only or ['N1','N2','N3','N4','N5','N6','N7','N12','N13','N14','passes-1','passes-7','passes-9','passes-16','JSON-rounding','JSON-duplicate','JSON-power-two','JSON-slash','JSON-low-surrogate',
-    'CAP-name-bytes','CAP-value-bytes','CAP-record-bytes','LINE-vt-ff','RECORD-collision-third','RECORD-rust-trim']
+    'CAP-name-bytes','CAP-value-bytes','CAP-record-bytes','LINE-vt-ff','RECORD-collision-third','RECORD-rust-trim','HMAC-key32']
 results_path=a.artifacts/'negative-controls.json'
 results=json.loads(results_path.read_text()) if results_path.exists() else []
 results=[r for r in results if r['control'] not in controls]
@@ -168,7 +171,25 @@ for name in controls:
     review_cases={'JSON-low-surrogate':'surrogate-last','CAP-name-bytes':'key-chars-',
                   'CAP-value-bytes':'value-chars-','CAP-record-bytes':'record-',
                   'LINE-vt-ff':'skip-vt','RECORD-collision-third':'collision-third','RECORD-rust-trim':'python-strip'}
-    if name in review_cases or name=='JSON-slash':
+    if name=='HMAC-key32':
+        output=a.artifacts/'hmac-keys'
+        run=subprocess.run([sys.executable,str(ROOT/'tests/conformance/hmac_keys.py'),str(binary),str(output)],capture_output=True,text=True)
+        log=run.stdout+run.stderr
+        summary=json.loads((output/'hmac-keys.json').read_text())
+        assert run.returncode==1 and summary['exit']==1 and summary['hmac_mismatches']>0,log[-2000:]
+        # Short raw keys are the positive control; longer normalized keys must
+        # fail for both redactor APIs, including the production-length key.
+        failed=set(summary['failed_ids'])
+        for length in (31,32):
+            assert not any(x.startswith('hmac-key/%d/direct/'%length) for x in failed)
+            assert not any(x.startswith('hmac-key/%d/file-padded/'%length) for x in failed)
+        for length in (33,64,128):
+            for source in ('direct','file-padded'):
+                for op in ('redact_text','redact_record'):
+                    assert 'hmac-key/%d/%s/aws-key/%s'%(length,source,op) in failed
+        mismatches=summary['hmac_mismatches']
+        gate_failures['hmac-keys']=mismatches
+    elif name in review_cases or name=='JSON-slash':
         checks=['differential']
         if name in ('JSON-slash','JSON-low-surrogate','LINE-vt-ff','RECORD-collision-third','RECORD-rust-trim'):
             checks.append('lines')
