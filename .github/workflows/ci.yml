@@ -48,6 +48,10 @@ jobs:
           python3 tools/test_crosscheck.py
           python3 tools/test_lock.py target/release/examples/lock_probe
           python3 tools/test_workflow.py
+      - name: Ingest function oracle and negative controls
+        run: |
+          python3 crates/ccs/tests/ingest_oracle.py
+          python3 crates/ccs/tests/ingest_mutations.py
       - name: Resume function Python differential gate
         run: python3 crates/ccs/tests/resume_oracle.py
   dependency-policy:
