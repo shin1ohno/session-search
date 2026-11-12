@@ -5,9 +5,9 @@ Character classes are expanded by asking Python's `re` which code points match, 
 \\w follow Python's membership. That aligns character sets only; it says nothing about how the
 two engines behave on an input, which structgen.py and the release gate test separately.
 
-Refuses (SystemExit) any construct it cannot translate with a stated reason, including a trailing
-\\b after a variable repeat whose class has non-word characters: the post-match check is only
-correct when no shorter repeat could have satisfied the boundary.
+Refuses (SystemExit) any construct it cannot translate with a stated reason. A trailing
+\\b needs a fixed-width prefix and at most one final, greedy, nonempty word-class repeat:
+the post-match check cannot retry a different endpoint when the boundary fails.
 
 usage: gen_redact_tables.py session_redact.py tables.rs [mutants.json]
 """
@@ -220,17 +220,71 @@ def cls_id(chars):
     return CLS.index(r)
 
 
-def check_tail(seq, icase):
-    """A trailing \\b is checked after the match, so a shorter repeat must never be able to pass it."""
-    if not seq:
-        return
-    op, av = seq[-1]
-    if op in (C.MAX_REPEAT, C.MIN_REPEAT) and av[0] != av[1]:
-        body = av[2]
-        if len(body) != 1 or body[0][0] not in (SET, C.LITERAL, C.IN):
-            raise SystemExit("trailing \\b after a complex variable repeat")
-        if not set(node_chars(body[0][0], body[0][1], icase)) <= WORD_SET:
-            raise SystemExit("trailing \\b after a variable repeat with non-word characters")
+def check_tail(seq, icase, terminal=True):
+    """Prove endpoint safety; return the fixed width, or None for a safe variable tail.
+
+Fixed-width choices all end at the same position. Only a final greedy word-class
+repeat (minimum >= 1) can vary: shortening it leaves word characters on both sides
+of the boundary. Nested groups inherit the position and case-folding context.
+"""
+    width = 0
+    for i, (op, av) in enumerate(seq):
+        last = terminal and i == len(seq) - 1
+        if op in (SET, C.LITERAL, C.NOT_LITERAL, C.ANY, C.IN):
+            size = 1
+        elif op is C.SUBPATTERN:
+            ic = (icase or bool(av[1] & re.I)) and not (av[2] & re.I)
+            size = check_tail(av[3], ic, last)
+        elif op is C.BRANCH:
+            sizes = {check_tail(a, icase, False) for a in av[1]}
+            if len(sizes) != 1:
+                raise SystemExit("trailing \\b after alternatives of unequal width")
+            size = sizes.pop()
+        elif op in (C.MAX_REPEAT, C.MIN_REPEAT):
+            lo, hi, body = av
+            if lo == hi:
+                size = lo * check_tail(body, icase, False)
+            else:
+                if op is C.MIN_REPEAT:
+                    raise SystemExit("trailing \\b after a lazy variable repeat")
+                if not last:
+                    raise SystemExit("trailing \\b after a non-final variable repeat")
+                if lo == 0:
+                    raise SystemExit("trailing \\b after a nullable variable repeat")
+                if len(body) != 1 or body[0][0] not in (SET, C.LITERAL, C.IN):
+                    raise SystemExit("trailing \\b after a complex variable repeat")
+                if not set(node_chars(body[0][0], body[0][1], icase)) <= WORD_SET:
+                    raise SystemExit("trailing \\b after a variable repeat with non-word characters")
+                size = None
+        elif op is C.AT and av is C.AT_END_STRING:
+            size = 0
+        else:
+            raise SystemExit("trailing \\b after unsupported node %r" % (op,))
+        if size is None:
+            return None  # Only possible at the final node, including through groups.
+        width += size
+    return width
+
+
+def check_tail_alternatives(alts, icase):
+    widths = [check_tail(a, icase) for a in alts]
+    prefixes = []
+    for a in alts:
+        prefix = []
+        for op, av in a:
+            if op not in (SET, C.LITERAL, C.NOT_LITERAL, C.ANY, C.IN):
+                break
+            prefix.append(set(node_chars(op, av, icase)))
+        prefixes.append(prefix)
+    for i, left in enumerate(prefixes):
+        for j in range(i):
+            if widths[i] is not None and widths[i] == widths[j]:
+                continue
+            # Distributed guards may be hoisted only if an alternative cannot
+            # retry another endpoint. Distinct literal/class prefixes prove this
+            # for the shipped github-token alternatives, despite their widths.
+            if not any(not (x & y) for x, y in zip(left, prefixes[j])):
+                raise SystemExit("overlapping alternatives before trailing \\b")
 
 
 def strip_guards(seq, icase):
@@ -271,8 +325,8 @@ def strip_guards(seq, icase):
         if all(tails):
             end = "Boundary"
             seq[-1] = [C.BRANCH, [None, [a[:-1] for a in alts]]]
-            for a in seq[-1][1][1]:
-                check_tail(a, icase)
+            check_tail(seq[:-1], icase, False)
+            check_tail_alternatives(seq[-1][1][1], icase)
         elif any(tails):
             raise SystemExit("mixed trailing boundary")
     return seq, start, end

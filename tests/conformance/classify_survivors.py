@@ -29,7 +29,7 @@ PREDICATES = {
     "end-anchored": "the repeat is followed only by an end-of-string anchor and its body is one character wide: only one count can reach the end",
     "disjoint-continuation": "the body is non-nullable and shares no first character with what follows: the text fixes the count",
     "run-determined": "every element up to a non-nullable delimiter draws from a set U and the delimiter is outside U: the delimiter is the first non-U character, so every parse ends there; no capture group lies in between",
-    "subsumed-optional": "the optional group's characters, including any a mutant adds, are inside the unbounded class that follows it: the span is the whole class run with or without the group",
+    "subsumed-optional": "the rule has no captures and the optional group's characters, including any a mutant adds, are inside the final greedy unbounded one-character class: the span is the whole class run with or without the group",
 }
 data = json.load(open(os.path.join(artifact_dir, "gate-mutants.json")))
 survivors = data["summary"]["survivors_of_all_inputs"]
@@ -94,6 +94,8 @@ def has_group(seq):
             return True
         if op is C.BRANCH and any(has_group(a) for a in av[1]):
             return True
+        if op in (C.ASSERT, C.ASSERT_NOT) and has_group(av[1]):
+            return True
     return False
 
 
@@ -142,11 +144,14 @@ def subsumed_optional(name, path_text, kind):
     if not is_repeat(node) or node[1][0] != 0:
         return False
     seq, i, sic, _ = chain[-1]
-    if i + 1 >= len(seq) or not is_repeat(seq[i + 1]) or seq[i + 1][1][1] is not C.MAXREPEAT:
+    if i + 1 >= len(seq) or seq[i + 1][0] is not C.MAX_REPEAT or seq[i + 1][1][1] is not C.MAXREPEAT:
         return False
     if i + 2 != len(seq):
         return False
-    cls = all_chars(seq[i + 1][1][2], sic)
+    body = seq[i + 1][1][2]
+    if len(body) != 1 or body[0][0] not in CHAR:
+        return False
+    cls = set(G.node_chars(body[0][0], body[0][1], sic))
     return all_chars(node[1][2], sic) <= cls and (added is None or added in cls)
 
 

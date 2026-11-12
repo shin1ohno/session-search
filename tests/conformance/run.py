@@ -29,6 +29,8 @@ def run(name,args,env=None,stdin=None,stdout=None):
     print('PASS',name,flush=True)
 
 run('gate-controls',[PY,HERE/'test_gate_controls.py'])
+run('gate-proofs',[PY,HERE/'test_gate_proofs.py'])
+run('proof-controls',[PY,HERE/'proof_controls.py',OUT/'proof-controls'])
 server=ROOT/'vendor/memory-mcp'
 corpus=server/'conformance/session_redact_r1.jsonl'
 with corpus.open('rb') as source,(OUT/'emit.jsonl').open('wb') as output:
@@ -43,6 +45,7 @@ run('lines',[PY,HERE/'line_diff.py',BINARY,'--count',str(settings['line_random_i
 fuzz=settings['redactor_random_inputs']
 run('differential',[PY,HERE/'differential.py',server/'session_redact.py',BINARY,OUT/'differential.jsonl',str(fuzz),'--seed',str(settings['redactor_seed'])])
 run('unicode-edges',[PY,HERE/'unicode_edges.py',server/'session_redact.py',BINARY,OUT/'unicode-edges.json'])
+run('hmac-keys',[PY,HERE/'hmac_keys.py',BINARY,OUT/'hmac-keys'])
 run('negative',[PY,HERE/'negative_controls.py',OUT/'negative'])
 run('build-mutants',[PY,HERE/'build_mutants.py',OUT,'--mutants',OUT/'mutants.json'])
 env=dict(os.environ,CCS_MUTANT_BINARY=str(OUT/'ccs-mutants'))
