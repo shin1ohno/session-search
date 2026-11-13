@@ -101,32 +101,6 @@ jobs:
           mkdir -p contract-output
           set -o pipefail
           python3 tests/contract/run_rust.py 2>&1 | tee contract-output/macos.txt
-      - name: Diagnostic token-cache stress (temporary, non-gating)
-        # The reusable release invocation skips this to keep one budget per push.
-        if: always() && github.workflow == 'ci'
-        continue-on-error: true
-        timeout-minutes: 15
-        run: |
-          export CCS_UNDER_TEST="$GITHUB_WORKSPACE/target/release/ccs"
-          export PYTHONPATH=tests
-          mkdir -p contract-output
-          set -o pipefail
-          python3 - <<'PY' 2>&1 | tee contract-output/cache-diagnostic.txt
-          import io, time, unittest
-          name = 'contract.test_auth_cache.TokenCacheContract.test_simultaneous_processes_share_one_grant'
-          started = time.monotonic()
-          for iteration in range(1, 301):
-              output = io.StringIO()
-              result = unittest.TextTestRunner(stream=output, verbosity=2).run(
-                  unittest.defaultTestLoader.loadTestsFromName(name))
-              print('Diagnostic iteration', iteration, 'passed' if result.wasSuccessful() else 'FAILED', flush=True)
-              if not result.wasSuccessful() or result.skipped:
-                  print(output.getvalue(), flush=True)
-                  raise SystemExit(1)
-              if time.monotonic() - started >= 840:
-                  print('Diagnostic time budget reached after', iteration, 'iterations', flush=True)
-                  break
-          PY
       - name: Save macOS contracts including skips
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
