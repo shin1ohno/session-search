@@ -577,8 +577,22 @@ impl Directory {
         }
     }
     fn lock(&self) -> io::Result<File> {
-        let file = self.open_file("token.lock", libc::O_RDWR | libc::O_CREAT)?;
         let start = Instant::now();
+        let file = loop {
+            match self.open_file("token.lock", libc::O_RDWR | libc::O_CREAT) {
+                Ok(file) => break file,
+                // Darwin can return ENOENT when an O_CREAT openat loses the
+                // first-creation race. Retry through all the same safety checks
+                // and keep creation plus flock within the existing time budget.
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        && start.elapsed() < Duration::from_secs(2) =>
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error),
+            }
+        };
         loop {
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
                 return Ok(file);

@@ -265,6 +265,10 @@ The Rust disk-cache fallback warning contains only a static operation name
 the `std::io::ErrorKind` name. It never includes the error's Display text, a
 path, a credential, a bearer or a bearer digest. The warning is emitted at most
 once per process; cache safety checks and the fallback policy still apply.
+An ENOENT while creating the persistent lock is retried within the same two-second
+budget as lock acquisition, covering Darwin's concurrent openat creation race.
+Every retry still checks the file type, owner, mode and single-link requirement
+and opens without following symlinks.
 
 While ccs runs, the core-dump soft limit is zero and the inherited hard limit is
 preserved. Immediately before replacing itself with an agent, ccs restores the

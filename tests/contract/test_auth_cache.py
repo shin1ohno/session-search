@@ -8,6 +8,7 @@ import fcntl
 import json
 import os
 import resource
+import platform
 import signal
 from pathlib import Path
 import subprocess
@@ -143,6 +144,36 @@ class TokenCacheContract(test_auth.AuthContract):
         }
         self.assertEqual(len(self.server.of("/token")), 1, "refresh stampede: %r" % diagnostics)
         self.assertEqual(len(self.server.of("/status")), 6)
+
+    def lock_open_fault(self):
+        library = Path(self.tmp) / "lock-open-fault.so"
+        apple = platform.system() == "Darwin"
+        command = ["cc", "-dynamiclib" if apple else "-shared", "-fPIC",
+                   str(Path(__file__).with_name("lock_open_fault.c")), "-o", str(library)]
+        if not apple:
+            command.append("-ldl")
+        compiled = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        self.env["DYLD_INSERT_LIBRARIES" if apple else "LD_PRELOAD"] = str(library)
+
+    def test_lock_create_enoent_keeps_single_grant(self):
+        self.lock_open_fault()
+        self.test_simultaneous_processes_share_one_grant()
+        self.assertTrue((self.cdir / ".lock-fault").is_file(), "openat injection did not run")
+
+    def test_persistent_lock_enoent_has_bounded_fallback(self):
+        self.lock_open_fault()
+        self.env["CCS_TEST_PERSISTENT_LOCK_ENOENT"] = "1"
+        self.setup_auth()
+        started = time.monotonic()
+        result = self.good("status", timeout=5)
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 2)
+        self.assertLess(elapsed, 4)
+        self.assertEqual(len(self.server.of("/token")), 1)
+        self.assertIn("operation=lock, errno=Some(2), kind=NotFound", result.stderr)
+        self.assertFalse(self.cache.exists())
+        self.assert_clean(result)
 
     def test_dead_lock_holder_and_orphan_are_recovered(self):
         self.setup_auth()
