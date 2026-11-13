@@ -564,7 +564,7 @@ fn token_failure() -> Error {
     Error::Unavailable("helper token acquisition unavailable".into())
 }
 // A waiter's deadline is not a failed grant or a failed API request. The
-// helper returns an error so its callback can use the ordinary request path.
+// picker recognizes this result and renders a bounded offline response.
 #[derive(Debug)]
 struct TokenWaitTimeout;
 impl std::fmt::Display for TokenWaitTimeout {

@@ -277,3 +277,13 @@ Rust writes a surrogateescaped code point on stdout as its original byte in ever
 locale. Python does so under C, POSIX and C.UTF-8, but raises UnicodeEncodeError
 under en_US.UTF-8. The Python contract harness pins LANG=C.UTF-8 and removes
 LC_ALL and LC_CTYPE so the oracle does not depend on the host locale.
+
+### D13: bounded token waiters
+
+A helper search waiting for an in-flight token grant keeps its request deadline
+(0.8 seconds for lexical search, 2 seconds otherwise). If that wait expires, the
+keystroke shows OFFLINE rows without recording a breaker failure. The single
+grant continues, and keystrokes after it completes receive server rows. A preview
+wait expiry similarly returns its unreachable banner without a breaker failure.
+Only the typed waiter deadline receives this treatment; failed grants, transport
+errors and non-2xx responses retain their existing breaker behavior.

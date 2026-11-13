@@ -10,7 +10,7 @@ import tempfile
 import time
 import unittest
 
-from contract.test_helper import HelperBase, SESSIONS
+from contract.test_helper import HelperBase, PREVIEW, SESSIONS
 from contract.test_auth import synthetic, headers
 
 
@@ -99,13 +99,13 @@ class RustHelperReview(HelperBase):
         self.start_picker()
         first = self.invoke(self.backend_command("first"))
         self.assertEqual(first.returncode, 0, first.stderr)
-        self.assertIn(b"sk_1\t", first.stdout)
+        self.assertIn(b"OFFLINE", first.stdout)
         self.assertTrue(completed.wait(3))
         time.sleep(.15)
         result = self.invoke(self.backend_command("second"))
         self.assertIn(b"sk_1\t", result.stdout)
         self.assertEqual(len(grants), 1, "grant incorrectly inherited the lexical deadline")
-        self.assertEqual(len(self.srv.of("/search")), 2)
+        self.assertEqual(len(self.srv.of("/search")), 1)
 
     def test_truncated_helper_body_falls_back_to_normal_request(self):
         short = tempfile.TemporaryDirectory(prefix="ccs-sock-", dir="/tmp")
@@ -132,10 +132,12 @@ class RustHelperReview(HelperBase):
     def test_inflight_waiters_do_not_open_breaker(self):
         self.auth()
         started = threading.Event()
+        completed = threading.Event()
         def handler(request):
             if request["path"] == "/token":
                 started.set()
                 time.sleep(1.5)
+                completed.set()
                 return 200, {"access_token": synthetic(1), "expires_in": 3599}, {}
             return 200, SESSIONS, {}
         self.srv.handler = handler
@@ -146,14 +148,46 @@ class RustHelperReview(HelperBase):
             time.sleep(.3)
             second = pool.submit(self.invoke, self.backend_command("second"))
             results = [first.result(), second.result()]
-        results.append(self.invoke(self.backend_command("third")))
         for result in results:
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn(b"sk_1\t", result.stdout)
-        self.assertEqual(len(self.srv.of("/search")), 3)
+            self.assertIn(b"OFFLINE", result.stdout)
         state = json.loads(self.breaker_path.read_text()) if self.breaker_path.exists() else {}
         self.assertEqual(state.get("failures", 0), 0)
         self.assertEqual(state.get("open_until", 0), 0)
+        self.assertTrue(completed.wait(3))
+        time.sleep(.15)
+        third = self.invoke(self.backend_command("third"))
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertIn(b"sk_1\t", third.stdout)
+        self.assertEqual(len(self.srv.of("/search")), 1)
+        self.assertEqual(len(self.srv.of("/token")), 1)
+
+    def test_preview_wait_deadline_does_not_open_breaker(self):
+        self.auth()
+        completed = threading.Event()
+        def handler(request):
+            if request["path"] == "/token":
+                time.sleep(1.8)
+                completed.set()
+                return 200, {"access_token": synthetic(1), "expires_in": 3599}, {}
+            return 200, PREVIEW, {}
+        self.srv.handler = handler
+        self.start_picker()
+        command = self.argv[self.argv.index("--preview") + 1]
+        command = command.replace("{1}", "sk_2").replace("{q}", "query")
+        first = self.invoke(command)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn(b"server unreachable:", first.stdout)
+        state = json.loads(self.breaker_path.read_text()) if self.breaker_path.exists() else {}
+        self.assertEqual(state.get("failures", 0), 0)
+        self.assertEqual(self.srv.of("/preview"), [])
+        self.assertTrue(completed.wait(3))
+        time.sleep(.15)
+        second = self.invoke(command)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn(b"t <x>", second.stdout)
+        self.assertEqual(len(self.srv.of("/token")), 1)
+        self.assertEqual(len(self.srv.of("/preview")), 1)
 
     def test_missing_secret_remains_internal_error_for_all_waiters(self):
         self.auth()

@@ -482,6 +482,9 @@ pub fn backend_query(
                 }
                 rows
             }
+            Err(error) if crate::api::is_token_wait_timeout(&error) => {
+                offline_rows(q, &flags, &opts, &host, env)?
+            }
             Err(Error::Unavailable(_) | Error::Usage(_)) => {
                 breaker.record_failure()?;
                 offline_rows(q, &flags, &opts, &host, env)?
@@ -732,7 +735,12 @@ fn preview_remote(
         Err(error) if crate::token::is_credential_error(&error) => {
             return Err(util::invalid("client secret unreadable"))
         }
-        Err(error) if crate::api::is_token_wait_timeout(&error) => return Err(error),
+        Err(error) if crate::api::is_token_wait_timeout(&error) => {
+            return Ok(format!(
+                "server unreachable: {}\n",
+                crate::cli::message(&error)
+            ));
+        }
         Err(e) => {
             breaker.record_failure()?;
             return Ok(format!("server unreachable: {}\n", crate::cli::message(&e)));
