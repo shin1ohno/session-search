@@ -990,13 +990,23 @@ mod pooled_lock_tests {
                     .set_read_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
                 let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut length = None;
                 loop {
                     let mut line = String::new();
                     reader.read_line(&mut line).unwrap();
                     if line == "\r\n" {
                         break;
                     }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = Some(value.trim().parse::<usize>().unwrap());
+                        }
+                    }
                 }
+                // Closing a socket with an unread POST body can reset it before
+                // the client receives our response. Consume the complete grant.
+                let mut request = vec![0; length.unwrap()];
+                reader.read_exact(&mut request).unwrap();
                 let body =
                     format!("{{\"access_token\":\"synthetic-handoff-{i}\",\"expires_in\":0}}");
                 write!(
@@ -1013,7 +1023,7 @@ mod pooled_lock_tests {
             host_label: "test".into(),
             auth_type: "client_credentials".into(),
             token_url: endpoint,
-            client_id: "test".into(),
+            client_id: "test".repeat(8192),
             secret_file: secret,
             audience: String::new(),
             hmac_key_file: dir.join("unused"),
