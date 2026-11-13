@@ -215,12 +215,14 @@ class ReviewPaths(CodexBase):
         finally:
             if p.poll() is None:
                 p.send_signal(signal.SIGINT)
-                try:
-                    p.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    p.kill()
-                    p.wait(timeout=3)
+            # Release the PTY before waiting: Darwin can hold process teardown
+            # while its terminal writer is blocked on an unread master.
             os.close(master)
+            try:
+                p.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                os.killpg(p.pid, signal.SIGKILL)
+                p.wait(timeout=10)
 
 
 if __name__ == "__main__":

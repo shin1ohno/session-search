@@ -30,6 +30,8 @@ class HelperBase(ClientCase):
         self.srv = FakeServer(lambda req: (200, PREVIEW if req["path"].endswith("/preview") else SESSIONS, {}))
         self.addCleanup(self.srv.close)
         self.write_config(self.srv.base)
+        (Path(self.tmp) / ".config").chmod(0o700)
+        (Path(self.tmp) / ".config/session-search").chmod(0o700)
         self.env["CLAUDE_CODE_SESSION_ID"] = "me"
 
     def start_picker(self, prefix=(), env=None):
@@ -41,6 +43,8 @@ class HelperBase(ClientCase):
                   "(p / 'fzf-live.tmp').write_text(json.dumps(data))\n"
                   "(p / 'fzf-live.tmp').replace(p / 'fzf-live.json')\n"
                   "while not (p / 'fzf-release').exists(): time.sleep(0.01)\n"
+                  "s = p / 'fzf-select'\n"
+                  "if s.exists(): sys.stdout.write(s.read_text()); raise SystemExit(0)\n"
                   "raise SystemExit(130)\n")
         self.child_env = dict(self.env, **(env or {}))
         self.proc = subprocess.Popen(list(prefix) + self.command + ["query"], env=self.child_env, cwd=self.tmp,
@@ -57,6 +61,10 @@ class HelperBase(ClientCase):
         self.child_env.update(data["env"])
         self.sock = None
         for arg in self.argv:
+            if "CCS_HELPER_SOCKET=" in arg:
+                command = arg.split("(", 1)[-1]
+                self.sock = shlex.split(command)[0].split("=", 1)[1]
+                break
             if "--unix-socket" in arg:
                 words = shlex.split(arg.split("(", 1)[-1])
                 self.sock = words[words.index("--unix-socket") + 1]
@@ -74,6 +82,8 @@ class HelperBase(ClientCase):
             os.killpg(self.proc.pid, signal.SIGKILL)
             out, err = self.proc.communicate(timeout=5)
             self.fail("picker did not exit: " + repr((out, err)))
+        if not hasattr(self, "picker_output"):
+            self.picker_output = (out, err)
         return self.proc.returncode
 
     def callback(self, prefix, **values):
@@ -136,9 +146,17 @@ class SameBytes(HelperBase):
 
     def test_query_text_round_trips(self):
         for query in ("it's", 'say "hi"', "マージ 認証", "a&b=c", "100% done", "  spaced  out ",
-                      "$HOME `id`", "x+y #frag ?q", "back\\slash"):
+                      "$HOME `id`", "x+y #frag ?q", "back\\slash", "-rf", "-x", "--force push"):
             self.assertEqual(self.invoke(self.backend_command(query)).returncode, 0)
             self.assertEqual(self.srv.of("/search")[-1]["body"]["q"], query.strip())
+
+    def test_leading_dash_preview_query(self):
+        for query in ("-rf", "-x", "--force push"):
+            command = self.argv[self.argv.index("--preview") + 1]
+            command = command.replace("{1}", shlex.quote("sk_2")).replace("{q}", shlex.quote(query))
+            result = self.invoke(command)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.srv.of("/preview")[-1]["query"]["q"], query)
 
     def test_helper_down_falls_back_to_the_process_command(self):
         self.assertIsNotNone(self.sock)
@@ -146,6 +164,30 @@ class SameBytes(HelperBase):
         result = self.invoke(self.backend_command("query"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, self.rows("query").encode())
+
+    def raw_helper(self, request):
+        import socket
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(5)
+            connection.connect(self.sock)
+            connection.sendall((request + " HTTP/1.0\r\nHost: ccs\r\n\r\n").encode())
+            chunks = []
+            while True:
+                data = connection.recv(65536)
+                if not data:
+                    break
+                chunks.append(data)
+        return int(b"".join(chunks).split(b" ", 2)[1])
+
+    def test_unknown_paths_methods_and_invalid_toggle_are_404(self):
+        for request in ("GET /nope", "GET /backend/x", "GET /toggle?letter=z", "GET /toggle?letter=sd",
+                        "POST /backend?q=x", "DELETE /preview?key=x", "HEAD /backend"):
+            self.assertEqual(self.raw_helper(request), 404)
+        self.assertEqual(self.raw_helper("GET /backend?q=xx"), 200)
+
+    def test_handler_exception_is_500(self):
+        self.srv.handler = lambda req: (200, [1], {})
+        self.assertEqual(self.raw_helper("GET /preview?key=key"), 500)
 
     def test_permissions(self):
         self.assertIsNotNone(self.sock)
@@ -169,19 +211,59 @@ class RunWiring(HelperBase):
         self.assertEqual(self.finish_picker(), 143)
         self.assertFalse(directory.exists())
 
-    @unittest.skipUnless(sys.platform == "linux" and platform.machine() in ("x86_64", "aarch64"),
-                         "bind fault injection requires the Linux syscall ABI")
+    def test_removed_on_sighup(self):
+        self.start_picker()
+        directory = Path(self.sock).parent
+        self.proc.send_signal(signal.SIGHUP)
+        self.assertEqual(self.finish_picker(), 129)
+        self.assertFalse(directory.exists())
+
+    def test_removed_on_sigint(self):
+        self.start_picker()
+        directory = Path(self.sock).parent
+        self.proc.send_signal(signal.SIGINT)
+        status = self.finish_picker()
+        self.assertEqual(status if status >= 0 else 128 - status, 130)
+        self.assertFalse(directory.exists())
+
+    @unittest.skipUnless(os.environ.get("CCS_RUST_CLIENT") == "1", "Rust D7 helper without curl")
+    def test_helper_runs_without_curl(self):
+        (self.bin / "curl").unlink(missing_ok=True)
+        self.start_picker()
+        self.assertIsNotNone(self.sock, "D7 lost the persistent helper without curl")
+        self.assertNotIn("curl", "\n".join(self.argv))
+        result = self.invoke(self.backend_command("query"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, self.rows("query").encode())
+
+    @unittest.skipUnless(sys.platform == "darwin" or
+                         (sys.platform == "linux" and platform.machine() in ("x86_64", "aarch64")),
+                         "bind fault injection requires a supported Unix ABI")
     def test_bind_failure_keeps_the_process_wiring(self):
         prefix = [sys.executable, str(Path(__file__).with_name("deny_bind.py"))]
         # Prove that failure is our injected errno, not a launcher/environment failure.
-        probe = subprocess.run(prefix + [sys.executable, "-c", "import socket,errno\n"
-                               "s=socket.socket(socket.AF_UNIX)\n"
-                               "try: s.bind('unused')\n"
-                               "except OSError as e: assert e.errno==errno.EADDRINUSE\n"
-                               "else: raise AssertionError('bind unexpectedly worked')\n"
-                               "finally: s.close()"], env=self.env, cwd=self.tmp, capture_output=True)
+        probe_command = [sys.executable, "-c", "import socket,errno\n"
+                         "s=socket.socket(socket.AF_UNIX)\n"
+                         "try: s.bind('unused')\n"
+                         "except OSError as e: assert e.errno==errno.EADDRINUSE\n"
+                         "else: raise AssertionError('bind unexpectedly worked')\n"
+                         "finally: s.close()"]
+        if sys.platform == "darwin":
+            # Probe the native executable boundary; a signed system Python can
+            # ignore DYLD environment variables independently of ccs.
+            source = Path(self.tmp) / "bind-probe.c"
+            binary = Path(self.tmp) / "bind-probe"
+            source.write_text("#include <sys/socket.h>\n#include <sys/un.h>\n#include <errno.h>\n"
+                              "int main(void) { struct sockaddr_un a = {0}; a.sun_family = AF_UNIX; "
+                              "a.sun_path[0] = 'x'; int fd = socket(AF_UNIX, SOCK_STREAM, 0); "
+                              "return !(bind(fd, (struct sockaddr *)&a, sizeof(a)) == -1 && errno == EADDRINUSE); }\n")
+            subprocess.run(["/usr/bin/clang", str(source), "-o", str(binary)], check=True)
+            probe_command = [str(binary)]
+        probe = subprocess.run(prefix + probe_command, env=self.env, cwd=self.tmp, capture_output=True)
         self.assertEqual(probe.returncode, 0, probe.stderr)
-        self.start_picker(prefix=prefix)
+        long_dir = Path(self.tmp) / ("long-socket-parent-" * 8)
+        long_dir.mkdir()
+        self.start_picker(prefix=prefix, env={"TMPDIR": str(long_dir)})
         self.assertIsNone(self.sock)
         result = self.invoke(self.backend_command("query"))
         self.assertEqual(result.returncode, 0, result.stderr)

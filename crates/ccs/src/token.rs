@@ -49,13 +49,13 @@ fn hex(bytes: &[u8]) -> String {
 fn fingerprint(bytes: &[u8]) -> String {
     hex(digest::digest(&digest::SHA256, bytes).as_ref())
 }
-fn warn_cache() {
+fn warn_cache(operation: &'static str, error: &io::Error) {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
-        let _ = writeln!(
-            io::stderr(),
-            "ccs: token cache unavailable or unsafe; continuing without cache"
-        );
+        crate::util::stderr_line(&format!(
+            "ccs: token cache unavailable or unsafe; continuing without cache (operation={operation}, errno={:?}, kind={:?})",
+            error.raw_os_error(), error.kind(),
+        ));
     }
 }
 fn invalid() -> io::Error {
@@ -66,6 +66,15 @@ fn invalid() -> io::Error {
 pub(crate) struct Credential {
     pub secret: String,
     generation: String,
+}
+const REJECTED_TOKEN_ERROR: &str = "token endpoint returned a previously rejected bearer";
+pub(crate) fn is_rejected_token_error(error: &Error) -> bool {
+    matches!(error, Error::Unavailable(message) if message == REJECTED_TOKEN_ERROR)
+}
+const CREDENTIAL_ERROR: &str = "client secret unreadable or empty";
+pub(crate) fn is_credential_error(error: &Error) -> bool {
+    matches!(error, Error::Unavailable(message)
+        if message.strip_prefix("server unreachable: ").unwrap_or(message) == CREDENTIAL_ERROR)
 }
 impl Credential {
     pub fn read(config: &Config) -> Result<Self> {
@@ -110,7 +119,7 @@ impl Credential {
                 generation: fingerprint(&bytes),
             })
         };
-        read().map_err(|_| Error::Unavailable("client secret unreadable or empty".into()))
+        read().map_err(|_| Error::Unavailable(CREDENTIAL_ERROR.into()))
     }
 }
 
@@ -340,10 +349,12 @@ impl TokenManager {
         };
         let key = Key::new(config, &credential);
         if !fresh
-            && self
-                .token
-                .as_ref()
-                .is_some_and(|t| t.key == key && t.reusable && t.valid_at(epoch(), Instant::now()))
+            && self.token.as_ref().is_some_and(|t| {
+                t.key == key
+                    && t.reusable
+                    && t.valid_at(epoch(), Instant::now())
+                    && !crate::api::bearer_rejected(t.value())
+            })
         {
             self.status = CacheStatus::Memory;
         } else {
@@ -358,7 +369,7 @@ impl TokenManager {
                 }
             }
             let dir = Directory::open(config.path.parent().unwrap_or(Path::new(".")))
-                .inspect_err(|_| warn_cache())
+                .inspect_err(|error| warn_cache("directory", error))
                 .ok();
             if !fresh {
                 self.token = dir
@@ -372,7 +383,7 @@ impl TokenManager {
                 // never unlinked, including on process exit or lock timeout.
                 let lock = dir
                     .as_ref()
-                    .and_then(|d| d.lock().inspect_err(|_| warn_cache()).ok());
+                    .and_then(|d| d.lock().inspect_err(|error| warn_cache("lock", error)).ok());
                 if lock.is_some() {
                     if let Some(d) = &dir {
                         d.clean_orphans();
@@ -389,13 +400,15 @@ impl TokenManager {
                     let obtained = epoch();
                     let start = Instant::now();
                     let (value, ttl) = fetch(&credential)?;
-                    if !bearer_safe(&value)
-                        || self.rejected.contains(&fingerprint(value.as_bytes()))
-                    {
+                    if !bearer_safe(&value) {
                         return Err(Error::Unavailable(
-                            "token endpoint returned an invalid or previously rejected bearer"
-                                .into(),
+                            "token endpoint returned an invalid bearer".into(),
                         ));
+                    }
+                    if self.rejected.contains(&fingerprint(value.as_bytes()))
+                        || crate::api::bearer_rejected(&value)
+                    {
+                        return Err(Error::Unavailable(REJECTED_TOKEN_ERROR.into()));
                     }
                     let token = Token::fresh(value, ttl, key, obtained, start);
                     if !token.valid_first_send_at(epoch(), Instant::now()) {
@@ -405,8 +418,8 @@ impl TokenManager {
                     }
                     if lock.is_some() {
                         if let Some(d) = &dir {
-                            if d.save(&token).is_err() {
-                                warn_cache();
+                            if let Err(error) = d.save(&token) {
+                                warn_cache("save", &error);
                             }
                         }
                     }
@@ -425,13 +438,17 @@ impl TokenManager {
             if !self.rejected.contains(&hash) {
                 self.rejected.push(hash);
             }
-            if let Ok(dir) = Directory::open(config.path.parent().unwrap_or(Path::new("."))) {
-                if let Ok(_lock) = dir.lock() {
-                    dir.invalidate(&token.value);
-                }
-            }
+            Self::reject_sent(config, &token.value);
         }
         self.status = CacheStatus::Rejected;
+    }
+    pub(crate) fn reject_sent(config: &Config, value: &str) {
+        crate::api::remember_rejected(value);
+        if let Ok(dir) = Directory::open(config.path.parent().unwrap_or(Path::new("."))) {
+            if let Ok(_lock) = dir.lock() {
+                dir.invalidate(value);
+            }
+        }
     }
 }
 
@@ -534,7 +551,7 @@ impl Directory {
             Ok(file) => file,
             Err(e) => {
                 if e.kind() != io::ErrorKind::NotFound {
-                    warn_cache();
+                    warn_cache("read", &e);
                 }
                 return None;
             }
@@ -551,15 +568,31 @@ impl Directory {
     }
     fn read_token(&self, key: &Key, rejected: &[String]) -> Option<Token> {
         let token = Token::decode(&self.read()?, key, epoch(), Instant::now())?;
-        if rejected.contains(&fingerprint(token.value.as_bytes())) {
+        if rejected.contains(&fingerprint(token.value.as_bytes()))
+            || crate::api::bearer_rejected(token.value())
+        {
             None
         } else {
             Some(token)
         }
     }
     fn lock(&self) -> io::Result<File> {
-        let file = self.open_file("token.lock", libc::O_RDWR | libc::O_CREAT)?;
         let start = Instant::now();
+        let file = loop {
+            match self.open_file("token.lock", libc::O_RDWR | libc::O_CREAT) {
+                Ok(file) => break file,
+                // Darwin can return ENOENT when an O_CREAT openat loses the
+                // first-creation race. Retry through all the same safety checks
+                // and keep creation plus flock within the existing time budget.
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        && start.elapsed() < Duration::from_secs(2) =>
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error),
+            }
+        };
         loop {
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
                 return Ok(file);
@@ -713,11 +746,11 @@ mod tests {
     use std::path::PathBuf;
 
     // Deliberately synthetic: not signed credentials or a real issuer's JWT.
-    const SYNTHETIC: &str = "eyJtest.payload.signature";
-    const REPLACEMENT: &str = "eyJtest.replacement.signature";
     struct Fixture {
         root: PathBuf,
         config: Config,
+        synthetic: String,
+        replacement: String,
     }
     impl Fixture {
         fn new() -> Self {
@@ -741,14 +774,19 @@ mod tests {
                 hmac_key_file: root.join("hmac.key"),
             };
             std::fs::write(&config.secret_file, "synthetic-credential").unwrap();
-            Self { root, config }
+            Self {
+                root,
+                config,
+                synthetic: format!("eyJtest.{}.signature", hex(&nonce)),
+                replacement: format!("eyJtest.r{}.signature", hex(&nonce)),
+            }
         }
         fn key(&self) -> Key {
             Key::new(&self.config, &Credential::read(&self.config).unwrap())
         }
         fn token(&self) -> Token {
             Token::fresh(
-                SYNTHETIC.into(),
+                self.synthetic.clone(),
                 Some(3599.0),
                 self.key(),
                 epoch(),
@@ -775,7 +813,7 @@ mod tests {
             let mut manager = TokenManager::default();
             manager
                 .acquire(&self.config, false, |_| {
-                    Ok((REPLACEMENT.into(), Some(3599.0)))
+                    Ok((self.replacement.clone(), Some(3599.0)))
                 })
                 .unwrap();
             manager
@@ -854,7 +892,7 @@ mod tests {
     fn clock_step_does_not_extend_memory_lifetime() {
         let f = Fixture::new();
         let start = Instant::now();
-        let token = Token::fresh(SYNTHETIC.into(), Some(3600.0), f.key(), 1000.0, start);
+        let token = Token::fresh(f.synthetic.clone(), Some(3600.0), f.key(), 1000.0, start);
         assert!(token.valid_at(1100.0, start + Duration::from_secs(100)));
         assert!(
             !token.valid_at(1100.0, start + Duration::from_secs(3601)),
@@ -960,7 +998,9 @@ mod tests {
         );
         std::fs::write(&disk, encode(&value).unwrap()).unwrap();
         manager
-            .acquire(&f.config, false, |_| Ok((REPLACEMENT.into(), Some(3600.0))))
+            .acquire(&f.config, false, |_| {
+                Ok((f.replacement.clone(), Some(3600.0)))
+            })
             .unwrap();
         assert_eq!(manager.status(), CacheStatus::Refreshed);
         std::fs::write(&f.config.secret_file, "rotated-synthetic-credential").unwrap();
@@ -972,7 +1012,9 @@ mod tests {
         assert_eq!(manager.status(), CacheStatus::Refreshed);
         f.config.endpoint.push_str("/changed");
         manager
-            .acquire(&f.config, false, |_| Ok((REPLACEMENT.into(), Some(3600.0))))
+            .acquire(&f.config, false, |_| {
+                Ok((f.replacement.clone(), Some(3600.0)))
+            })
             .unwrap();
         assert_eq!(manager.status(), CacheStatus::Refreshed);
         std::fs::remove_file(&f.config.secret_file).unwrap();
@@ -992,7 +1034,7 @@ mod tests {
         manager
             .acquire(&f.config, false, |_| {
                 fetched = true;
-                Ok((REPLACEMENT.into(), Some(3599.0)))
+                Ok((f.replacement.clone(), Some(3599.0)))
             })
             .unwrap();
         assert!(
@@ -1007,14 +1049,14 @@ mod tests {
             let f = Fixture::new();
             let mut manager = TokenManager::default();
             manager
-                .acquire(&f.config, false, |_| Ok((SYNTHETIC.into(), ttl)))
+                .acquire(&f.config, false, |_| Ok((f.synthetic.clone(), ttl)))
                 .unwrap();
             assert!(!f.root.join("token.json").exists());
             let mut fetched = false;
             manager
                 .acquire(&f.config, false, |_| {
                     fetched = true;
-                    Ok((REPLACEMENT.into(), Some(3599.0)))
+                    Ok((f.replacement.clone(), Some(3599.0)))
                 })
                 .unwrap();
             assert!(fetched, "expiry-unknown bearer was reused");
@@ -1039,7 +1081,7 @@ mod tests {
             match case {
                 "changed" => {
                     let mut t = f.token();
-                    t.value = REPLACEMENT.into();
+                    t.value = f.replacement.clone();
                     Directory::open(&f.root).unwrap().save(&t).unwrap();
                 }
                 "gone" => std::fs::remove_file(&cache).unwrap(),
@@ -1055,7 +1097,7 @@ mod tests {
             );
             assert!(
                 manager
-                    .acquire(&f.config, true, |_| Ok((SYNTHETIC.into(), Some(3599.0))))
+                    .acquire(&f.config, true, |_| Ok((f.synthetic.clone(), Some(3599.0))))
                     .is_err(),
                 "rejected bearer was accepted again"
             );
@@ -1165,7 +1207,7 @@ mod tests {
     fn fresh_grant_margin_applies_only_to_reuse() {
         let f = Fixture::new();
         let start = Instant::now();
-        let token = Token::fresh(SYNTHETIC.into(), Some(61.0), f.key(), 1000.0, start);
+        let token = Token::fresh(f.synthetic.clone(), Some(61.0), f.key(), 1000.0, start);
         assert!(
             token.valid_first_send_at(1001.3, start + Duration::from_millis(1300)),
             "fresh grant lost its first send to the reuse margin"
@@ -1177,7 +1219,7 @@ mod tests {
     fn memory_wall_clock_margin_is_independent_of_monotonic_budget() {
         let f = Fixture::new();
         let start = Instant::now();
-        let token = Token::fresh(SYNTHETIC.into(), Some(3600.0), f.key(), 1000.0, start);
+        let token = Token::fresh(f.synthetic.clone(), Some(3600.0), f.key(), 1000.0, start);
         assert!(
             !token.valid_at(4570.0, start),
             "forward wall clock lost the expiry margin"

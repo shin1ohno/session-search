@@ -43,19 +43,13 @@ impl Diagnostics {
             return Err(Error::Io(io::Error::from_raw_os_error(libc::EBADF)));
         }
         let line = format!("{message}\n");
-        // SAFETY: line stays live; fd 2 is borrowed, never closed here.
-        let written = unsafe { libc::write(libc::STDERR_FILENO, line.as_ptr().cast(), line.len()) };
-        if written < 0 {
-            Err(Error::Io(io::Error::last_os_error()))
-        } else {
-            Ok(())
-        }
+        util::stderr_write(line.as_bytes()).map_err(Error::Io)
     }
 }
 fn display(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
-fn repr(value: &Value) -> String {
+pub(crate) fn repr(value: &Value) -> String {
     match value {
         Value::Null => "None".into(),
         Value::Bool(v) => if *v { "True" } else { "False" }.into(),
@@ -434,9 +428,30 @@ fn exec_path(agent: &str, args: &[&str]) -> io::Error {
         // SAFETY: path and argv are NUL-terminated, remain live, and argv ends
         // in a null pointer. execv preserves the process environment.
         unsafe {
+            let mut core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            let inherited = crate::cli::agent_core_limit();
+            if let Some(soft) = inherited {
+                if libc::getrlimit(libc::RLIMIT_CORE, &mut core) != 0 {
+                    return io::Error::last_os_error();
+                }
+                core.rlim_cur = soft;
+                if libc::setrlimit(libc::RLIMIT_CORE, &core) != 0 {
+                    return io::Error::last_os_error();
+                }
+            }
             libc::execv(candidate.as_ptr(), pointers.as_ptr());
+            last = io::Error::last_os_error();
+            // Failed exec leaves this address space alive: protect it again.
+            if inherited.is_some() {
+                core.rlim_cur = 0;
+                if libc::setrlimit(libc::RLIMIT_CORE, &core) != 0 {
+                    return io::Error::last_os_error();
+                }
+            }
         }
-        last = io::Error::last_os_error();
         if !matches!(last.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) && saved.is_none() {
             saved = Some(io::Error::from_raw_os_error(
                 last.raw_os_error().unwrap_or(libc::EIO),
@@ -1149,8 +1164,8 @@ fn resume_inner(req: &ResumeRequest, diagnostics: &Diagnostics) -> Result<ExitSt
             restore_claude(&mut api, meta, &cwd, &sid, req, diagnostics)
         };
         result.map_err(|e| match e {
-            Error::Unavailable(s)
-                if s.starts_with("token ") || s == "client secret unreadable or empty" =>
+            e if crate::token::is_credential_error(&e)
+                || matches!(&e, Error::Unavailable(s) if s.starts_with("token ")) =>
             {
                 util::invalid("archive response or authentication failed")
             }
@@ -1176,6 +1191,9 @@ fn resume_inner(req: &ResumeRequest, diagnostics: &Diagnostics) -> Result<ExitSt
 pub fn resume(request: &ResumeRequest) -> Result<ExitStatus> {
     let diagnostics = Diagnostics::capture();
     match resume_inner(request, &diagnostics) {
+        Err(error) if crate::token::is_credential_error(&error) => {
+            Err(util::invalid("credential error"))
+        }
         Err(e @ (Error::ResumePrecondition(_) | Error::Unavailable(_))) => {
             if let Error::ResumePrecondition(message) | Error::Unavailable(message) = &e {
                 diagnostics.write(&format!("ccs: {message}"))?;

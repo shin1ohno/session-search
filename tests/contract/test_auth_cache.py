@@ -8,6 +8,7 @@ import fcntl
 import json
 import os
 import resource
+import platform
 import signal
 from pathlib import Path
 import subprocess
@@ -43,7 +44,7 @@ class TokenCacheContract(test_auth.AuthContract):
             ("format", True), ("format", "1"), ("access_token", []),
             ("access_token", "eyJbad.\nvalue.signature"),
             ("expires_at", "999999999999"), ("expires_at", float("inf")),
-            ("obtained_at", float("nan")), ("obtained_at", time.time() + 301),
+            ("obtained_at", float("nan")), ("obtained_at", lambda: time.time() + 301),
             ("expires_at", time.time() + 99999), ("expires_at", time.time() - 1),
             ("endpoint", "https://different.example"), ("token_url", "https://different.example/token"),
             ("client_id", "different"), ("audience", "different"),
@@ -51,7 +52,7 @@ class TokenCacheContract(test_auth.AuthContract):
         ]
         for key, value in cases:
             with self.subTest(field=key):
-                data = dict(original, **{key: value})
+                data = dict(original, **{key: value() if callable(value) else value})
                 self.cache.write_text(json.dumps(data))
                 before = len(self.server.of("/token"))
                 self.assert_clean(self.good("status"))
@@ -131,8 +132,48 @@ class TokenCacheContract(test_auth.AuthContract):
         for result in results:
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assert_clean(result)
-        self.assertEqual(len(self.server.of("/token")), 1, "refresh stampede")
+        diagnostics = {
+            "states": [[line for line in result.stdout.splitlines() if line.startswith("token:")]
+                       for result in results],
+            "cache_warnings": ["token cache unavailable or unsafe" in result.stderr for result in results],
+            "cache_diagnostics": [[line for line in result.stderr.splitlines()
+                                   if line.startswith("ccs: token cache unavailable or unsafe;")]
+                                  for result in results],
+            "cache_exists": self.cache.is_file(),
+            "lock_inode": (self.cdir / "token.lock").stat().st_ino,
+        }
+        self.assertEqual(len(self.server.of("/token")), 1, "refresh stampede: %r" % diagnostics)
         self.assertEqual(len(self.server.of("/status")), 6)
+
+    def lock_open_fault(self):
+        library = Path(self.tmp) / "lock-open-fault.so"
+        apple = platform.system() == "Darwin"
+        command = ["cc", "-dynamiclib" if apple else "-shared", "-fPIC",
+                   str(Path(__file__).with_name("lock_open_fault.c")), "-o", str(library)]
+        if not apple:
+            command.append("-ldl")
+        compiled = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        self.env["DYLD_INSERT_LIBRARIES" if apple else "LD_PRELOAD"] = str(library)
+
+    def test_lock_create_enoent_keeps_single_grant(self):
+        self.lock_open_fault()
+        self.test_simultaneous_processes_share_one_grant()
+        self.assertTrue((self.cdir / ".lock-fault").is_file(), "openat injection did not run")
+
+    def test_persistent_lock_enoent_has_bounded_fallback(self):
+        self.lock_open_fault()
+        self.env["CCS_TEST_PERSISTENT_LOCK_ENOENT"] = "1"
+        self.setup_auth()
+        started = time.monotonic()
+        result = self.good("status", timeout=5)
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 2)
+        self.assertLess(elapsed, 4)
+        self.assertEqual(len(self.server.of("/token")), 1)
+        self.assertIn("operation=lock, errno=Some(2), kind=NotFound", result.stderr)
+        self.assertFalse(self.cache.exists())
+        self.assert_clean(result)
 
     def test_dead_lock_holder_and_orphan_are_recovered(self):
         self.setup_auth()

@@ -222,3 +222,72 @@ The initial A1 session-search pin can use the already merged baseline commit.
 R0 reverts this contract PR and setup's separate corpus/ai-memory-pin commit.
 The independent A1 session-search pin commit can be reverted separately. No Rust
 artifact or host switch is part of S0.
+
+## Rust CLI integration gate
+
+The Rust CI job runs `tests/contract/run_rust.py` against the release binary with
+`CCS_AUTH_DISK_CACHE=1` and `CCS_RUST_CLIENT=1`. Missing flags, any skipped auth
+contract, or a skipped Rust process/helper contract fail the job. The job installs
+a native Codex binary and retains the complete test output, including every skip
+and its reason. `crates/ccs/tests/cli_oracle.py` compares parsing and received
+requests with Python; `cli_interop.py` stages Python with the real vendor modules
+and runs the state tests with both Rust/Python writer-reader assignments.
+
+Rust adds `completion zsh`, the A2 signal/core-dump boundary, and D6's single-line
+panic diagnostic. The regular HTTP client retains `Connection: close`; the picker
+uses one shared HTTP agent with at most two idle connections per host. Only a
+POST /search or GET /preview on a reused connection may be retried once after a
+disconnect before any response bytes. The search body stays identical; each
+attempt acquires a bearer again. Other routes, fresh connections and partial
+responses never receive this transport retry. The existing one-refresh
+401 policy remains separate, with a shared rejected-token registry for concurrent
+helper requests. Loopback tests observe connection counts, overlapping requests,
+response ownership, and 401 recovery through the callbacks given to fzf.
+
+D7 uses the same private helper socket through `ccs _backend`, `_preview` and
+`_toggle`; callbacks carry its path in `CCS_HELPER_SOCKET` and fall back to the
+ordinary process path if the helper is unavailable. No curl executable is needed.
+The helper socket is 0600 inside a 0700 directory; picker exit and handled signals
+remove the directory. No production endpoint is used by these gates.
+
+The helper serializes token acquisition without holding a mutex during credential,
+flock or network I/O. Waiters use their request deadline and share a failed grant
+for one second. A process-wide digest registry survives API config changes and
+poisoned coordination locks. Token grants use a separate agent, so their
+close-per-request connections cannot consume the search/preview pool. TLS
+requests clone the agent's cached certificate configuration; HTTP does not fail
+for an invalid certificate bundle. Endpoint/auth/client/token URL changes rebuild
+the pool. Search/preview response bodies are limited to 4 MiB, and at most 32
+helper callback/fuse workers run concurrently.
+
+The Rust disk-cache fallback warning contains only a static operation name
+(`directory`, `lock`, `read` or `save`), the raw numeric errno (or `None`), and
+the `std::io::ErrorKind` name. It never includes the error's Display text, a
+path, a credential, a bearer or a bearer digest. The warning is emitted at most
+once per process; cache safety checks and the fallback policy still apply.
+An ENOENT while creating the persistent lock is retried within the same two-second
+budget as lock acquisition, covering Darwin's concurrent openat creation race.
+Every retry still checks the file type, owner, mode and single-link requirement
+and opens without following symlinks.
+
+While ccs runs, the core-dump soft limit is zero and the inherited hard limit is
+preserved. Immediately before replacing itself with an agent, ccs restores the
+soft limit it inherited at startup. If exec fails, ccs disables core dumps again
+before handling the error or trying the next PATH entry.
+
+### D12: surrogateescaped stdout
+
+Rust writes a surrogateescaped code point on stdout as its original byte in every
+locale. Python does so under C, POSIX and C.UTF-8, but raises UnicodeEncodeError
+under en_US.UTF-8. The Python contract harness pins LANG=C.UTF-8 and removes
+LC_ALL and LC_CTYPE so the oracle does not depend on the host locale.
+
+### D13: bounded token waiters
+
+A helper search waiting for an in-flight token grant keeps its request deadline
+(0.8 seconds for lexical search, 2 seconds otherwise). If that wait expires, the
+keystroke shows OFFLINE rows without recording a breaker failure. The single
+grant continues, and keystrokes after it completes receive server rows. A preview
+wait expiry similarly returns its unreachable banner without a breaker failure.
+Only the typed waiter deadline receives this treatment; failed grants, transport
+errors and non-2xx responses retain their existing breaker behavior.
