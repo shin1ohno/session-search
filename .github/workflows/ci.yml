@@ -165,7 +165,8 @@ jobs:
           CCS_TEST_CODEX="$codex_test_bin" python3 -m unittest discover -s tests -v
 
   test-python39:
-    runs-on: ubuntu-latest
+    # ubuntu-latest moved to 26.04, which has no Python 3.9 build for setup-python.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
