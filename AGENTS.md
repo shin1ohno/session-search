@@ -39,8 +39,8 @@ python3 tools/test_crosscheck.py
 python3 -m unittest discover -s tests -v
 ```
 
-From S2, also run `CCS_UNDER_TEST=target/release/ccs python3 -m unittest
-discover -s tests/contract` and `target/release/ccs _conformance redact <
+From S2, also run `CCS_UNDER_TEST="$PWD/target/release/ccs" CCS_AUTH_DISK_CACHE=1
+CCS_RUST_CLIENT=1 python3 tests/contract/run_rust.py` and `target/release/ccs _conformance redact <
 vendor/memory-mcp/conformance/session_redact_r1.jsonl`. In S1 the latter must
 fail explicitly; `tools/release_gate.py` prevents publishing that skeleton.
 

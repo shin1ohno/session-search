@@ -11,6 +11,7 @@ pub mod fallback;
 pub mod helper;
 pub mod ingest;
 pub mod picker;
+pub mod query;
 pub mod resume;
 pub mod session_codex;
 pub mod token;

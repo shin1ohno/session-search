@@ -309,10 +309,10 @@ fn run_inner(args: &[std::ffi::OsString]) -> Result<()> {
         )?;
         if json::dumps_compact(&result, true, false)? != json::dumps_compact(expected, true, false)?
         {
-            eprintln!(
+            ccs::util::stderr_line(&format!(
                 "FAIL conformance: {}",
                 json::dumps_compact(&Value::string(&id), true, false)?
-            );
+            ));
             failures += 1;
         }
         if emit
@@ -343,12 +343,14 @@ fn run_inner(args: &[std::ffi::OsString]) -> Result<()> {
         return Err("corpus count or digest mismatch".into());
     }
     if suite == "codex" {
-        eprintln!("conformance codex: vectors={count} failures={failures} emitted={emitted}");
+        ccs::util::stderr_line(&format!(
+            "conformance codex: vectors={count} failures={failures} emitted={emitted}"
+        ));
     } else {
-        eprintln!(
+        ccs::util::stderr_line(&format!(
             "conformance redact: vectors={count} failures={failures} emitted={emitted} pass_limit={}",
             ccs_redact::MAX_PASSES
-        );
+        ));
     }
     if failures != 0 {
         return Err("conformance mismatch".into());
@@ -360,7 +362,7 @@ pub fn run(args: &[std::ffi::OsString]) -> std::process::ExitCode {
     match run_inner(args) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(_) => {
-            eprintln!("ccs: conformance failed");
+            ccs::util::stderr_line("ccs: conformance failed");
             std::process::ExitCode::FAILURE
         }
     }

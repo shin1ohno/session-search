@@ -58,6 +58,10 @@ class ClientCase(HomeCase):
                 shutil.copyfile(self.repo / "vendor/memory-mcp" / name, stage / "ccs" / name)
             self.env["PYTHONPATH"] = str(stage)
             self.command = [sys.executable, "-m", "ccs"]
+        # D12: Python stdout must preserve surrogateescaped filesystem bytes.
+        self.env["LANG"] = "C.UTF-8"
+        self.env.pop("LC_ALL", None)
+        self.env.pop("LC_CTYPE", None)
         launcher = self.bin / "ccs"
         launcher.write_text("#!/bin/sh\nexec " + " ".join(shlex.quote(s) for s in self.command) + ' "$@"\n')
         launcher.chmod(0o755)

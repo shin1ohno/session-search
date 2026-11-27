@@ -122,6 +122,9 @@ fn run_rg(argv: &[OsString]) -> Result<Vec<u8>> {
     Ok(output)
 }
 pub fn candidates(query: &str, root: Option<&Path>) -> Result<Vec<PathBuf>> {
+    candidates_query(&crate::query::Query::from(query), root)
+}
+pub fn candidates_query(query: &crate::query::Query, root: Option<&Path>) -> Result<Vec<PathBuf>> {
     let include_codex = root.is_none();
     let native = if include_codex {
         codex::paths()
@@ -142,12 +145,13 @@ pub fn candidates(query: &str, root: Option<&Path>) -> Result<Vec<PathBuf>> {
             "no local transcript directories exist".into(),
         ));
     }
-    if ccs_pytext::strip(query).chars().count() < 2 {
+    if query.trimmed().points().len() < 2 {
         let mut paths = main_files(root);
         paths.extend(native);
         return Ok(newest(paths, Some(RECENT_CAP)));
     }
-    let mut argv = rg_argv(query, &roots[0]);
+    let mut argv = rg_argv("", &roots[0]);
+    argv[9] = query.os_string();
     argv.extend(roots[1..].iter().map(|p| p.as_os_str().into()));
     let bytes = run_rg(&argv)?;
     let mut valid = Vec::new();
@@ -188,9 +192,16 @@ pub fn search_options(
     query: &str,
     options: &SearchOptions<'_>,
 ) -> Result<Vec<extract::LocalSession>> {
-    let query = ccs_pytext::strip(query);
-    let short = query.chars().count() < 2;
-    let paths = candidates(query, options.root)?;
+    search_options_query(&crate::query::Query::from(query), options)
+}
+pub fn search_options_query(
+    query: &crate::query::Query,
+    options: &SearchOptions<'_>,
+) -> Result<Vec<extract::LocalSession>> {
+    let query = query.trimmed();
+    let short = query.points().len() < 2;
+    let paths = candidates_query(&query, options.root)?;
+    let query = query.points();
     let mut indexed = std::thread::scope(|scope| {
         let mut workers = vec![];
         for offset in 0..4 {
@@ -202,7 +213,7 @@ pub fn search_options(
                     .skip(offset)
                     .step_by(4)
                     .map(|(i, p)| {
-                        extract::scan_checked(p, if short { None } else { Some(query) }, 4)
+                        extract::scan_checked_points(p, if short { &[] } else { query }, 4)
                             .map(|session| (i, session))
                     })
                     .collect::<Result<Vec<_>>>()
