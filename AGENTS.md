@@ -10,6 +10,7 @@
 | Rust workspace (S1 foundation, S2 implementation) | `crates/` |
 | External-process contract | `tests/contract/`, `docs/contract.md` |
 | Build and conformance gates | `tools/` |
+| Python/Rust comparison on a frozen copy of real transcripts (S3; reports hold counts and digests only) | `tools/shadow/` |
 | Tests and their hermetic helpers | `tests/`, `tests/support.py` |
 | Server-owned modules shipped inside the package | `vendor/memory-mcp/` |
 | Where the vendored files came from | `vendor/memory-mcp/SOURCE` |
