@@ -188,6 +188,77 @@ pub struct SearchOptions<'a> {
     pub exclude_session_id: Option<&'a str>,
     pub root: Option<&'a Path>,
 }
+/// Worker threads for the candidate scan (A6 in the migration plan).
+pub const SCAN_THREADS: usize = 4;
+/// What one scan worker did. The search ignores these; examples/offline_bench.rs reports them.
+#[derive(Clone, Debug, Default)]
+pub struct WorkerStats {
+    pub tasks: usize,
+    pub bytes: u64,
+    pub busy: Duration,
+}
+#[derive(Clone, Debug, Default)]
+pub struct ScanStats {
+    pub workers: Vec<WorkerStats>,
+}
+/// Scan every candidate and return the sessions in candidate order.
+///
+/// Worker k takes candidates k, k+threads, k+2*threads, ... A worker stops at
+/// its first error, and the first failing worker in worker order decides the
+/// error.
+pub fn scan_paths(
+    paths: &[PathBuf],
+    query: &[u32],
+    threads: usize,
+) -> (Result<Vec<extract::LocalSession>>, ScanStats) {
+    let threads = threads.max(1);
+    let (indexed, stats) = std::thread::scope(|scope| {
+        let mut workers = vec![];
+        for offset in 0..threads {
+            workers.push(scope.spawn(move || {
+                let started = Instant::now();
+                let mut stats = WorkerStats::default();
+                let result = paths
+                    .iter()
+                    .enumerate()
+                    .skip(offset)
+                    .step_by(threads)
+                    .map(|(i, p)| {
+                        stats.tasks += 1;
+                        stats.bytes += fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                        extract::scan_checked_points(p, query, 4).map(|session| (i, session))
+                    })
+                    .collect::<Result<Vec<_>>>();
+                stats.busy = started.elapsed();
+                (result, stats)
+            }));
+        }
+        let mut out = Ok(vec![]);
+        let mut stats = ScanStats::default();
+        for worker in workers {
+            let (result, worker_stats) = match worker.join() {
+                Ok(joined) => joined,
+                Err(_) => (
+                    Err(util::invalid("local scan worker failed")),
+                    WorkerStats::default(),
+                ),
+            };
+            stats.workers.push(worker_stats);
+            if let Ok(found) = &mut out {
+                match result {
+                    Ok(sessions) => found.extend(sessions),
+                    Err(error) => out = Err(error),
+                }
+            }
+        }
+        (out, stats)
+    });
+    let sessions = indexed.map(|mut indexed| {
+        indexed.sort_by_key(|(i, _)| *i);
+        indexed.into_iter().map(|(_, s)| s).collect()
+    });
+    (sessions, stats)
+}
 pub fn search_options(
     query: &str,
     options: &SearchOptions<'_>,
@@ -201,38 +272,13 @@ pub fn search_options_query(
     let query = query.trimmed();
     let short = query.points().len() < 2;
     let paths = candidates_query(&query, options.root)?;
-    let query = query.points();
-    let mut indexed = std::thread::scope(|scope| {
-        let mut workers = vec![];
-        for offset in 0..4 {
-            let paths = &paths;
-            workers.push(scope.spawn(move || {
-                paths
-                    .iter()
-                    .enumerate()
-                    .skip(offset)
-                    .step_by(4)
-                    .map(|(i, p)| {
-                        extract::scan_checked_points(p, if short { &[] } else { query }, 4)
-                            .map(|session| (i, session))
-                    })
-                    .collect::<Result<Vec<_>>>()
-            }));
-        }
-        let mut out = vec![];
-        for worker in workers {
-            out.extend(
-                worker
-                    .join()
-                    .map_err(|_| util::invalid("local scan worker failed"))??,
-            );
-        }
-        Ok(out)
-    })?;
-    indexed.sort_by_key(|(i, _)| *i);
-    Ok(indexed
+    let (sessions, _) = scan_paths(
+        &paths,
+        if short { &[] } else { query.points() },
+        SCAN_THREADS,
+    );
+    Ok(sessions?
         .into_iter()
-        .map(|(_, s)| s)
         .filter(|s| {
             (short || s.hits > 0)
                 && !options
@@ -323,6 +369,38 @@ mod tests {
         assert_eq!(result.len(), 200);
         assert_eq!(result[0], paths[249]);
         assert!(!result.contains(&paths[0]));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn scan_keeps_candidate_order_for_any_thread_count() {
+        let root = std::env::temp_dir().join(format!(
+            "ccs-scan-{}-{}",
+            std::process::id(),
+            util::now_epoch().to_bits()
+        ));
+        fs::create_dir(&root).unwrap();
+        // Outside ~/.claude/projects the reader opens nothing, so this pins
+        // order and accounting only; the oracles under a temporary HOME pin
+        // the scanned content.
+        let mut paths = Vec::new();
+        for i in 0..23 {
+            let p = root.join(format!("s{i}.jsonl"));
+            fs::write(&p, "x".repeat(10 * i + 1)).unwrap();
+            paths.push(p);
+        }
+        let total: u64 = paths.iter().map(|p| fs::metadata(p).unwrap().len()).sum();
+        let query: Vec<u32> = "needle".chars().map(u32::from).collect();
+        for threads in [1, 3, 4, 8] {
+            let (found, stats) = scan_paths(&paths, &query, threads);
+            let found: Vec<_> = found.unwrap().into_iter().map(|s| s.path).collect();
+            assert_eq!(found, paths, "threads={threads}");
+            assert_eq!(stats.workers.len(), threads);
+            assert_eq!(
+                stats.workers.iter().map(|w| w.tasks).sum::<usize>(),
+                paths.len()
+            );
+            assert_eq!(stats.workers.iter().map(|w| w.bytes).sum::<u64>(), total);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 }
