@@ -128,17 +128,43 @@ def snippet_parts(result: tuple):
     return result[0], result[2], dump(value), sorted(snippets), sorted(result[1]), tuple(snippets)
 
 
+def reruns(py: list, rs: list, args: list, env: dict, home: Path, first: tuple) -> tuple:
+    """Python and Rust results for one command after its first (py1, rs, py2) runs differed.
+
+    Each extra round runs Python then Rust, so the sequence py rs py | py rs |
+    py rs ... gives both implementations both phases of a server that
+    alternates between two replicas on every call. Without that, py1 and py2
+    always meet one replica and Rust the other.
+    """
+    pys, rss = [first[0], first[2]], [first[1]]
+    for _ in range(RETRIES):
+        pys.append(run(py, args, env, home))
+        rss.append(run(rs, args, env, home))
+    return pys, rss
+
+
+def rerun_verdict(pys: list, rss: list, normalize=lambda r: r) -> str:
+    """server-changed when every Rust answer is one the server also gave Python, else different.
+
+    The online search backend answers from replicas whose BM25 statistics
+    differ slightly, and rows with equal scores can swap between them, so
+    Python's own answers vary from call to call.
+    """
+    seen = {normalize(p) for p in pys}
+    return "server-changed" if all(normalize(r) in seen for r in rss) else "different"
+
+
 def order_verdict(pys: list, rss: list) -> str:
     """server-changed | server-order | different, for an online preview whose first runs differed.
 
     The server ranks preview snippets with no tie-breaking sort (ai-memory
     memory-mcp/sessions_search.py preview_match_body), so hits with equal scores
     can come back in either order. That excuses a difference only with evidence
-    from the reruns: a Rust run byte-identical to a Python run, or Rust runs
+    from the reruns: every Rust answer is one Python also got, or Rust runs
     whose snippet order itself varies. A Rust order that never varies and never
     matches Python's is a Rust difference.
     """
-    if any(r == p for r in rss for p in pys):
+    if rerun_verdict(pys, rss) == "server-changed":
         return "server-changed"
     parts = [snippet_parts(x) for x in pys + rss]
     if parts[0] is None or any(p is None or p[:5] != parts[0][:5] for p in parts):
@@ -259,6 +285,8 @@ def main(argv=None) -> int:
             args = ["search", q]
             py1, r, py2 = run(py, args, env, home), run(rs, args, env, home), run(py, args, env, home)
             outcome = verdict(py1, r, py2, normalize=server_noise_removed)
+            if outcome == "different":
+                outcome = rerun_verdict(*reruns(py, rs, args, env, home, (py1, r, py2)), server_noise_removed)
             if outcome == "equal" and score_text_mismatch(py1, r):
                 outcome = "score-format"
             tally.add("search-online", outcome, "online:" + q, hits(py1[1]))
@@ -267,11 +295,7 @@ def main(argv=None) -> int:
                 p1, r, p2 = run(py, args, env, home), run(rs, args, env, home), run(py, args, env, home)
                 outcome = verdict(p1, r, p2)
                 if outcome == "different":
-                    pys, rss = [p1, p2], [r]
-                    for _ in range(RETRIES):
-                        rss.append(run(rs, args, env, home))
-                        pys.append(run(py, args, env, home))
-                    outcome = order_verdict(pys, rss)
+                    outcome = order_verdict(*reruns(py, rs, args, env, home, (p1, r, p2)))
                 tally.add("preview-online", outcome, "preview-online:" + key + q)
         outcome = verdict(run(py, ["status"], env, home), run(rs, ["status"], env, home),
                           run(py, ["status"], env, home), normalize=without_token_line)

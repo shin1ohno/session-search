@@ -223,8 +223,8 @@ class ReadVerdict(unittest.TestCase):
         order, python = read.order_verdict, [out([a, b, c])] * 3
         # Rust follows the server: its own order varies across reruns.
         self.assertEqual(order(python, [out([b, a, c]), out([c, b, a])]), "server-order")
-        # A rerun byte-identical to Python shows Rust can produce Python's output.
-        self.assertEqual(order(python, [out([b, a, c]), out([a, b, c])]), "server-changed")
+        # Every Rust answer is one the server also gave Python.
+        self.assertEqual(order(python + [out([b, a, c])], [out([b, a, c]), out([a, b, c])]), "server-changed")
         # A Rust order that never varies and never matches is a Rust difference.
         self.assertEqual(order(python, [out([b, a, c])] * 3), "different")
         # Number types and formatting outside the order still count.
@@ -236,6 +236,30 @@ class ReadVerdict(unittest.TestCase):
         # A changed snippet is not a reorder, nor is a changed exit code.
         self.assertEqual(order(python, [out([b, a, dict(c, fragment="w")]), out([c, b, a])]), "different")
         self.assertEqual(order(python, [(1,) + out([b, a, c])[1:], (1,) + out([c, b, a])[1:]]), "different")
+
+    def test_online_search_differences_are_excused_only_by_answers_python_also_got(self):
+        def out(order, score):
+            rows = [{"session_key": k, "score": score} for k in order]
+            return (0, json.dumps({"sessions": rows, "took_ms": 1}).encode(), b"")
+        n, rv = read.server_noise_removed, read.rerun_verdict
+        # Two replicas swap tied rows; Rust meets both, and so does Python.
+        replica_a, replica_b = out("xy", 1.5), out("yx", 1.25)
+        self.assertEqual(rv([replica_a, replica_a, replica_b], [replica_b, replica_a], n), "server-changed")
+        # One Rust answer Python never got is a Rust difference.
+        self.assertEqual(rv([replica_a, replica_b], [replica_b, out("xz", 1.5)], n), "different")
+        self.assertEqual(rv([replica_a, replica_a], [replica_b, replica_b], n), "different")
+
+    def test_reruns_give_both_implementations_both_replicas(self):
+        calls, replicas = [], iter("AB" * 20)
+        original = read.run
+        read.run = lambda command, *rest: calls.append(command) or (0, next(replicas).encode(), b"")
+        try:
+            first = (read.run("py"), read.run("rs"), read.run("py"))
+            pys, rss = read.reruns("py", "rs", [], {}, Path("."), first)
+        finally:
+            read.run = original
+        self.assertEqual({p[1] for p in pys}, {b"A", b"B"})
+        self.assertEqual({r[1] for r in rss}, {b"A", b"B"})
 
     def test_gate_requires_an_equal_comparison_and_hits(self):
         t = read.Tally()
