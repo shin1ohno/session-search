@@ -921,4 +921,148 @@ mod projection_tests {
         );
         assert!(project_claude(&rejected).is_none());
     }
+
+    /// Each UTF-16 unit as a JSON escape, built at run time so the source
+    /// holds no escape that an editor or tool could decode.
+    fn escaped(s: &str) -> String {
+        let backslash = char::from(92u8);
+        s.encode_utf16()
+            .map(|unit| format!("{backslash}u{unit:04x}"))
+            .collect()
+    }
+
+    fn assert_same(lines: &[String]) {
+        for line in lines {
+            let text = format!("{line}\n");
+            let projected = project_claude(&text);
+            let reference = strict(&text);
+            assert!(
+                projected.as_ref().map(observe) == reference.as_ref().map(observe),
+                "projection differs on {line:.200}"
+            );
+            if let Some(value) = reference {
+                discard_record(value);
+            }
+        }
+    }
+
+    #[test]
+    fn escaped_keys_and_boundaries_match_strict_loading() {
+        let template = r#"{"type":"user","cwd":"/w","entrypoint":"cli","relocatedCwd":"/r","customTitle":"T","aiTitle":"A","summary":"S","isMeta":true,"isCompactSummary":true,"message":{"role":"user","content":[{"type":"text","text":"hi needle"}]}}"#;
+        let mut lines = vec![template.to_string()];
+        for key in [
+            "type",
+            "cwd",
+            "entrypoint",
+            "relocatedCwd",
+            "customTitle",
+            "aiTitle",
+            "summary",
+            "isMeta",
+            "isCompactSummary",
+            "message",
+            "content",
+            "text",
+        ] {
+            let raw = format!("\"{key}\":");
+            let whole = format!("\"{}\":", escaped(key));
+            let first = format!("\"{}{}\":", escaped(&key[..1]), &key[1..]);
+            assert!(template.contains(&raw), "{key}");
+            lines.push(template.replacen(&raw, &whole, 1));
+            lines.push(template.replacen(&raw, &first, 1));
+            // A raw and an escaped spelling of one key are a duplicate.
+            lines.push(template.replacen(&raw, &format!("{raw}null,{whole}"), 1));
+        }
+        assert!(
+            lines[1].contains(char::from(92u8)),
+            "escapes must be literal"
+        );
+        let smile = "\u{1f600}";
+        lines.push(format!(
+            r#"{{"{smile}":1,"{}":2,"type":"user"}}"#,
+            escaped(smile)
+        ));
+        lines.push(format!(
+            r#"{{"{}":1,"type":"user","message":{{"content":"x"}}}}"#,
+            escaped(smile)
+        ));
+        for (inner, outer) in [
+            ("1".repeat(4300), ""),
+            ("1".repeat(4301), ""),
+            (format!("{}1{}", "[".repeat(255), "]".repeat(255)), ""),
+            (format!("{}1{}", "[".repeat(256), "]".repeat(256)), ""),
+            (format!("{}1{}", "[".repeat(257), "]".repeat(257)), ""),
+            (r#"{"id":1,"id":2}"#.to_string(), ""),
+            ("1".to_string(), r#","id":1,"id":2"#),
+        ] {
+            lines.push(format!(
+                r#"{{"type":"user","payload":{inner},"message":{{"content":"x"{outer}}}}}"#
+            ));
+        }
+        lines.push(
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"x","k":1,"k":2}]}}"#
+                .to_string(),
+        );
+        lines.push(r#"{"type":"user","isMeta":truex,"message":{"content":"x"}}"#.to_string());
+        lines.push(r#"{"type":"user","isMeta":true ,"message":{"content":"x"}}"#.to_string());
+        assert_same(&lines);
+        let kept = lines
+            .iter()
+            .filter(|l| strict(&format!("{l}\n")).is_some())
+            .count();
+        assert!(
+            kept > 20 && kept < lines.len(),
+            "kept {kept} of {}",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn records_read_files_as_strict_loading_does() {
+        let mut long = br#"{"type":"user","message":{"content":""#.to_vec();
+        long.extend(std::iter::repeat_n(b'x', 3 << 20));
+        long.extend_from_slice(
+            b"needle\"}}\n{\"type\":\"user\",\"message\":{\"content\":\"short needle\"}}\n",
+        );
+        let cases: Vec<Vec<u8>> = vec![
+            vec![],
+            b"{\"type\":\"user\",\"message\":{\"content\":\"one needle\"}}\n{\"type\":\"user\",\"message\":{\"content\":\"partial needle\"}}".to_vec(),
+            b"{\"type\":\"user\",\"message\":{\"content\":\"bad \xff byte needle\"}}\n".to_vec(),
+            b"{\"type\":\"user\",\"message\":{\"content\":\"crlf needle\"}}\r\n{\"type\":\"assistant\",\"message\":{\"content\":\"two\"}}\r\n".to_vec(),
+            b"{\"type\":\"user\",\"a\xff\":1,\"a\xfe\":2,\"message\":{\"content\":\"replaced keys collide\"}}\n".to_vec(),
+            b"\n\n[1]\n{\"type\":\"user\",\"message\":{\"content\":\"after blanks needle\"}}\n".to_vec(),
+            long,
+        ];
+        let path = std::env::temp_dir().join(format!(
+            "ccs-records-{}-{}.jsonl",
+            std::process::id(),
+            util::now_epoch().to_bits()
+        ));
+        for (n, bytes) in cases.iter().enumerate() {
+            fs::write(&path, bytes).unwrap();
+            let reference: Vec<Value> = bytes
+                .split_inclusive(|&b| b == b'\n')
+                .filter(|l| l.ends_with(b"\n"))
+                .filter_map(|l| strict(&ccs_pytext::decode_replace(l)))
+                .collect();
+            for query in [None, Some("needle")] {
+                let records = Records {
+                    reader: Some(BufReader::with_capacity(
+                        1 << 20,
+                        fs::File::open(&path).unwrap(),
+                    )),
+                    line: Vec::new(),
+                    index: None,
+                    position: 0,
+                    entrypoint: Value::Null,
+                    cwd: Value::Null,
+                    failure: None,
+                };
+                let got = scan_reader(&path, query, 4, records).unwrap().value();
+                let want = scan_records(&path, query, 4, reference.clone()).value();
+                assert!(got == want, "case {n} with query {query:?}");
+            }
+        }
+        fs::remove_file(path).unwrap();
+    }
 }

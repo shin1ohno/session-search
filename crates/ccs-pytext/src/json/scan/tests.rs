@@ -592,17 +592,42 @@ fn is_true_reads_only_the_literal() {
 
 #[test]
 fn eq_str_compares_decoded_text() {
-    let first = |text: &'static str| Reader::new(text).string().unwrap().unwrap();
-    assert!(first(r#""😀""#).eq_str("\u{1f600}"));
-    assert!(first("\"\u{1f600}\"").eq_str("\u{1f600}"));
-    assert!(!first(r#""\ud83d""#).eq_str("\u{fffd}"));
-    assert!(!first(r#""\ud800x""#).eq_str("x"));
-    assert!(first(r#""é""#).eq_str("é"));
-    assert!(first("\"é\"").eq_str("é"));
-    assert!(!first("\"é\"").eq_str("e"));
-    assert!(!first(r#""é""#).eq_str("e\u{301}"));
-    assert!(first(r#""""#).eq_str(""));
-    assert!(!first(r#""\n""#).eq_str(""));
+    let backslash = char::from(92u8);
+    // Each UTF-16 unit written as a JSON escape. Built at run time so the
+    // source holds no escape that an editor or tool could decode.
+    let escaped = |s: &str| -> String {
+        s.encode_utf16()
+            .map(|unit| format!("{backslash}u{unit:04x}"))
+            .collect()
+    };
+    let read = |body: &str, text: &str| {
+        let quoted = format!("\"{body}\"");
+        let mut r = Reader::new(&quoted);
+        let s = r.string().unwrap().unwrap();
+        (s.eq_str(text), s.points())
+    };
+    let lone = format!("{backslash}ud83d");
+    assert_eq!(
+        read(&escaped("\u{1f600}"), "\u{1f600}"),
+        (true, vec![0x1f600])
+    );
+    assert_eq!(read("\u{1f600}", "\u{1f600}"), (true, vec![0x1f600]));
+    assert_eq!(read(&lone, "\u{fffd}"), (false, vec![0xd83d]));
+    assert_eq!(read(&format!("{lone}x"), "x"), (false, vec![0xd83d, 0x78]));
+    assert_eq!(read(&escaped("é"), "é"), (true, vec![0xe9]));
+    assert_eq!(read("é", "é"), (true, vec![0xe9]));
+    assert!(!read("é", "e").0);
+    assert!(!read(&escaped("é"), "e\u{301}").0);
+    assert!(read(&escaped("cwd"), "cwd").0);
+    assert!(!read(&escaped("cwd"), "cw").0);
+    assert!(!read(&escaped("cwd"), "cwdx").0);
+    assert!(read(&format!("c{}d", escaped("w")), "cwd").0);
+    assert!(read("", "").0);
+    assert!(!read(&format!("{backslash}n"), "").0);
+    assert!(
+        escaped("cwd").starts_with(backslash),
+        "the escape must be literal"
+    );
 }
 
 #[test]
