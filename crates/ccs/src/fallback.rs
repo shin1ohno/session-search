@@ -8,6 +8,7 @@ use std::io::Read;
 use std::os::unix::{ffi::OsStrExt, process::ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub const BANNER: &str = "OFFLINE — local sessions only, ≤200 newest candidates per agent";
@@ -203,59 +204,64 @@ pub struct ScanStats {
 }
 /// Scan every candidate and return the sessions in candidate order.
 ///
-/// Worker k takes candidates k, k+threads, k+2*threads, ... A worker stops at
-/// its first error, and the first failing worker in worker order decides the
-/// error.
+/// Workers take candidates from one shared queue, largest file first, so a
+/// single large transcript starts at once instead of holding up its worker's
+/// whole share. Every candidate is scanned. If any fail, the error of the
+/// earliest failing candidate is returned, as a sequential scan would stop
+/// there.
 pub fn scan_paths(
     paths: &[PathBuf],
     query: &[u32],
     threads: usize,
 ) -> (Result<Vec<extract::LocalSession>>, ScanStats) {
-    let threads = threads.max(1);
-    let (indexed, stats) = std::thread::scope(|scope| {
-        let mut workers = vec![];
-        for offset in 0..threads {
-            workers.push(scope.spawn(move || {
-                let started = Instant::now();
-                let mut stats = WorkerStats::default();
-                let result = paths
-                    .iter()
-                    .enumerate()
-                    .skip(offset)
-                    .step_by(threads)
-                    .map(|(i, p)| {
+    let threads = threads.max(1).min(paths.len().max(1));
+    let mut queue: Vec<(u64, usize)> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (fs::metadata(p).map(|m| m.len()).unwrap_or(0), i))
+        .collect();
+    queue.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let next = AtomicUsize::new(0);
+    let (outcomes, stats) = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let started = Instant::now();
+                    let mut stats = WorkerStats::default();
+                    let mut outcomes = vec![];
+                    while let Some(&(bytes, i)) = queue.get(next.fetch_add(1, Ordering::Relaxed)) {
                         stats.tasks += 1;
-                        stats.bytes += fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-                        extract::scan_checked_points(p, query, 4).map(|session| (i, session))
-                    })
-                    .collect::<Result<Vec<_>>>();
-                stats.busy = started.elapsed();
-                (result, stats)
-            }));
-        }
-        let mut out = Ok(vec![]);
+                        stats.bytes += bytes;
+                        outcomes.push((i, extract::scan_checked_points(&paths[i], query, 4)));
+                    }
+                    stats.busy = started.elapsed();
+                    (outcomes, stats)
+                })
+            })
+            .collect();
+        let mut outcomes = vec![];
         let mut stats = ScanStats::default();
+        let mut panicked = false;
         for worker in workers {
-            let (result, worker_stats) = match worker.join() {
-                Ok(joined) => joined,
-                Err(_) => (
-                    Err(util::invalid("local scan worker failed")),
-                    WorkerStats::default(),
-                ),
-            };
-            stats.workers.push(worker_stats);
-            if let Ok(found) = &mut out {
-                match result {
-                    Ok(sessions) => found.extend(sessions),
-                    Err(error) => out = Err(error),
+            match worker.join() {
+                Ok((found, worker_stats)) => {
+                    outcomes.extend(found);
+                    stats.workers.push(worker_stats);
+                }
+                Err(_) => {
+                    panicked = true;
+                    stats.workers.push(WorkerStats::default());
                 }
             }
         }
-        (out, stats)
+        if panicked {
+            return (Err(util::invalid("local scan worker failed")), stats);
+        }
+        (Ok(outcomes), stats)
     });
-    let sessions = indexed.map(|mut indexed| {
-        indexed.sort_by_key(|(i, _)| *i);
-        indexed.into_iter().map(|(_, s)| s).collect()
+    let sessions = outcomes.and_then(|mut outcomes| {
+        outcomes.sort_by_key(|(i, _)| *i);
+        outcomes.into_iter().map(|(_, s)| s).collect()
     });
     (sessions, stats)
 }
