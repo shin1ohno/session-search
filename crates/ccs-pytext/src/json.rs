@@ -2,6 +2,8 @@
 //! Bounded parsing continues validating after a limit, so limits never select the text route.
 use std::collections::{HashMap, HashSet};
 
+pub mod scan;
+
 pub const MAX_INT_DIGITS: usize = 4300;
 
 #[derive(Clone, Debug, PartialEq)]
