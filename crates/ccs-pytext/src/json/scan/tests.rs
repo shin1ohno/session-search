@@ -69,6 +69,9 @@ fn nesting(text: &str) -> usize {
 }
 
 fn build(r: &mut Reader<'_>) -> Result<Value, Error> {
+    if r.is_true()? {
+        return Ok(Value::Bool(true));
+    }
     if let Some(s) = r.string()? {
         return Ok(Value::String(s.points()));
     }
@@ -526,6 +529,80 @@ fn strings_decode_and_compare() {
     assert!(!s.eq_str("cwdx"));
     let mut r = Reader::new(r#""cwd""#);
     assert!(r.string().unwrap().unwrap().eq_str("cwd"));
+}
+
+#[test]
+fn a_callback_reading_two_values_is_refused() {
+    let two_strings = |text: &str| {
+        let mut r = Reader::new(text);
+        r.object(|_, r| {
+            r.string()?;
+            r.string()?;
+            Ok(())
+        })
+        .and_then(|_| r.finish())
+    };
+    assert_eq!(two_strings(r#"{"k":"a""b"}"#), Err(Error::Syntax));
+    assert_eq!(two_strings(r#"{"k":"a"}"#), Err(Error::Syntax));
+    let one_string = |text: &str| {
+        let mut r = Reader::new(text);
+        r.object(|_, r| r.string().map(|_| ()))
+            .and_then(|_| r.finish())
+    };
+    assert_eq!(one_string(r#"{"k":"a","j":"b"}"#), Ok(()));
+    assert_eq!(one_string(r#"{"k":"a""b"}"#), Err(Error::Syntax));
+    let mut r = Reader::new(r#"["a","b"]"#);
+    let read = r.array(|r| {
+        r.string()?;
+        r.scalar()?;
+        Ok(())
+    });
+    assert_eq!(read, Err(Error::Syntax));
+    let mut r = Reader::new(r#"{"a":{"b":1},"c":2}"#);
+    let read = r.object(|_, r| {
+        r.object(|_, _| Ok(()))?;
+        r.skip()
+    });
+    assert_eq!(read, Err(Error::Syntax));
+}
+
+#[test]
+fn is_true_reads_only_the_literal() {
+    let mut r = Reader::new("true");
+    assert_eq!(r.is_true(), Ok(true));
+    assert_eq!(r.finish(), Ok(()));
+    let mut r = Reader::new("truex");
+    assert_eq!(r.is_true(), Ok(true));
+    assert_eq!(r.finish(), Err(Error::Syntax));
+    let mut r = Reader::new("false");
+    assert_eq!(r.is_true(), Ok(false));
+    assert_eq!(r.skip(), Ok(()));
+    assert_eq!(r.finish(), Ok(()));
+    for text in [r#"{"a":true1}"#, r#"[truefalse]"#, r#"{"a":tru}"#] {
+        let mut r = Reader::new(text);
+        let read = r.object(|_, r| r.is_true().map(|_| ())).and_then(|object| {
+            if !object {
+                r.array(|r| r.is_true().map(|_| ()))?;
+            }
+            Ok(())
+        });
+        assert!(read.and_then(|_| r.finish()).is_err(), "{text}");
+    }
+}
+
+#[test]
+fn eq_str_compares_decoded_text() {
+    let first = |text: &'static str| Reader::new(text).string().unwrap().unwrap();
+    assert!(first(r#""😀""#).eq_str("\u{1f600}"));
+    assert!(first("\"\u{1f600}\"").eq_str("\u{1f600}"));
+    assert!(!first(r#""\ud83d""#).eq_str("\u{fffd}"));
+    assert!(!first(r#""\ud800x""#).eq_str("x"));
+    assert!(first(r#""é""#).eq_str("é"));
+    assert!(first("\"é\"").eq_str("é"));
+    assert!(!first("\"é\"").eq_str("e"));
+    assert!(!first(r#""é""#).eq_str("e\u{301}"));
+    assert!(first(r#""""#).eq_str(""));
+    assert!(!first(r#""\n""#).eq_str(""));
 }
 
 #[test]

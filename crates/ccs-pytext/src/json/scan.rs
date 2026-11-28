@@ -10,7 +10,9 @@
 //!
 //! Values the caller asks for come back as borrowed slices. Every other value
 //! is validated and skipped without being built. Any error means a strict
-//! load of the same text would fail, so the caller drops the text.
+//! load of the same text would fail, so the caller drops the text; a Reader
+//! is not usable after it has returned an error. A callback that reads more
+//! than one value where one value stands gets a syntax error.
 use super::{Error, MAX_INT_DIGITS};
 use std::collections::HashSet;
 
@@ -124,7 +126,9 @@ fn hex4(b: &[u8], i: usize) -> Option<u32> {
     Some(v)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Compare keys only through `bytes()`: a raw and an escaped spelling of the
+/// same key hold equal bytes in different variants.
+#[derive(Clone, Debug)]
 enum Key<'a> {
     Raw(&'a [u8]),
     Owned(Vec<u8>),
@@ -181,6 +185,9 @@ pub struct Reader<'a> {
     sets: Vec<KeySet<'a>>,
     used: usize,
     open: Vec<Open>,
+    /// True while the cursor stands where exactly one value is expected and
+    /// none has been read yet.
+    ready: bool,
 }
 
 const LO: u64 = 0x0101_0101_0101_0101;
@@ -203,9 +210,19 @@ impl<'a> Reader<'a> {
             sets: Vec::new(),
             used: 0,
             open: Vec::new(),
+            ready: true,
         };
         r.ws();
         r
+    }
+
+    /// Refuse a second read where one value stands.
+    fn expect_value(&self) -> Result<(), Error> {
+        if self.ready {
+            Ok(())
+        } else {
+            Err(Error::Syntax)
+        }
     }
 
     fn ws(&mut self) {
@@ -366,6 +383,8 @@ impl<'a> Reader<'a> {
 
     /// Validate and pass over the value at the cursor, at any depth.
     pub fn skip(&mut self) -> Result<(), Error> {
+        self.expect_value()?;
+        self.ready = false;
         let base = self.open.len();
         'value: loop {
             match self.peek()? {
@@ -436,25 +455,37 @@ impl<'a> Reader<'a> {
 
     /// Read the string at the cursor; `None`, consuming nothing, if it is not a string.
     pub fn string(&mut self) -> Result<Option<Str<'a>>, Error> {
+        self.expect_value()?;
         if self.peek()? != b'"' {
             return Ok(None);
         }
+        self.ready = false;
         self.token().map(Some)
     }
 
-    /// Consume the literal `true` at the cursor; false, consuming nothing, otherwise.
+    /// Consume the literal `true` at the cursor; false, consuming nothing,
+    /// otherwise. Text glued to it fails at the next separator check.
     pub fn is_true(&mut self) -> Result<bool, Error> {
+        self.expect_value()?;
         if self.b[self.i..].starts_with(b"true") {
             self.i += 4;
+            self.ready = false;
             return Ok(true);
         }
         Ok(false)
     }
 
-    /// Read the number or literal at the cursor as written; `None`, consuming nothing, otherwise.
+    /// Read the number or literal at the cursor as written; `None`,
+    /// consuming nothing, when a string, array or object stands there. Any
+    /// other byte is a syntax error.
     pub fn scalar(&mut self) -> Result<Option<&'a str>, Error> {
+        self.expect_value()?;
         let start = self.i;
-        Ok(self.try_scalar()?.then(|| &self.text[start..self.i]))
+        if !self.try_scalar()? {
+            return Ok(None);
+        }
+        self.ready = false;
+        Ok(Some(&self.text[start..self.i]))
     }
 
     /// Visit each member of the object at the cursor. A member the callback
@@ -464,9 +495,11 @@ impl<'a> Reader<'a> {
         &mut self,
         mut visit: impl FnMut(Str<'a>, &mut Self) -> Result<(), Error>,
     ) -> Result<bool, Error> {
+        self.expect_value()?;
         if self.peek()? != b'{' {
             return Ok(false);
         }
+        self.ready = false;
         self.i += 1;
         self.ws();
         if self.peek()? == b'}' {
@@ -476,9 +509,9 @@ impl<'a> Reader<'a> {
         let set = self.take_set();
         let mut key = self.key(set)?;
         loop {
-            let start = self.i;
+            self.ready = true;
             visit(key, self)?;
-            if self.i == start {
+            if self.ready {
                 self.skip()?;
             }
             self.ws();
@@ -503,9 +536,11 @@ impl<'a> Reader<'a> {
         &mut self,
         mut visit: impl FnMut(&mut Self) -> Result<(), Error>,
     ) -> Result<bool, Error> {
+        self.expect_value()?;
         if self.peek()? != b'[' {
             return Ok(false);
         }
+        self.ready = false;
         self.i += 1;
         self.ws();
         if self.peek()? == b']' {
@@ -513,9 +548,9 @@ impl<'a> Reader<'a> {
             return Ok(true);
         }
         loop {
-            let start = self.i;
+            self.ready = true;
             visit(self)?;
-            if self.i == start {
+            if self.ready {
                 self.skip()?;
             }
             self.ws();
