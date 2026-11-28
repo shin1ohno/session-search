@@ -138,8 +138,113 @@ fn discard_record(value: Value) {
     }
 }
 
+/// The top-level string fields scan_records_points reads from a Claude record.
+const CLAUDE_STRINGS: [&str; 7] = [
+    "type",
+    "cwd",
+    "entrypoint",
+    "relocatedCwd",
+    "customTitle",
+    "aiTitle",
+    "summary",
+];
+
+/// A Claude record reduced to what scan_records_points and
+/// record_text_points read: the string fields above, `isMeta` and
+/// `isCompactSummary` when they are `true`, and the `type` and `text`
+/// strings of `message.content`. Large tool payloads are validated but
+/// never built. A line a strict load rejects, or one that is not an
+/// object, gives None, as both are skipped.
+fn project_claude(text: &str) -> Option<Value> {
+    use json::scan::Reader;
+    let mut r = Reader::new(text);
+    let mut fields = Vec::new();
+    let object = r
+        .object(|key, r| {
+            if CLAUDE_STRINGS.iter().any(|name| key.eq_str(name)) {
+                if let Some(s) = r.string()? {
+                    fields.push((key.points(), Value::String(s.points())));
+                }
+            } else if key.eq_str("isMeta") || key.eq_str("isCompactSummary") {
+                if r.is_true()? {
+                    fields.push((key.points(), Value::Bool(true)));
+                }
+            } else if key.eq_str("message") {
+                let mut message = Vec::new();
+                if r.object(|key, r| {
+                    if !key.eq_str("content") {
+                        return Ok(());
+                    }
+                    if let Some(s) = r.string()? {
+                        message.push((key.points(), Value::String(s.points())));
+                        return Ok(());
+                    }
+                    let mut blocks = Vec::new();
+                    if r.array(|r| {
+                        let mut block = Vec::new();
+                        r.object(|key, r| {
+                            if key.eq_str("type") || key.eq_str("text") {
+                                if let Some(s) = r.string()? {
+                                    block.push((key.points(), Value::String(s.points())));
+                                }
+                            }
+                            Ok(())
+                        })?;
+                        if !block.is_empty() {
+                            blocks.push(Value::Object(block));
+                        }
+                        Ok(())
+                    })? {
+                        message.push((key.points(), Value::Array(blocks)));
+                    }
+                    Ok(())
+                })? {
+                    fields.push((key.points(), Value::Object(message)));
+                }
+            }
+            Ok(())
+        })
+        .ok()?;
+    if !object {
+        return None;
+    }
+    r.finish().ok()?;
+    Some(Value::Object(fields))
+}
+
+/// Everything scan_records_points can observe of one record.
+#[cfg(any(test, debug_assertions))]
+fn observe(rec: &Value) -> (Vec<Option<Vec<u32>>>, Vec<u32>) {
+    (
+        CLAUDE_STRINGS
+            .iter()
+            .map(|name| points(get(rec, name)).map(<[u32]>::to_vec))
+            .collect(),
+        record_text_points(rec),
+    )
+}
+
+/// Debug builds, which the differential oracles run, check every projected
+/// line against a strict load. The message carries no transcript text.
+#[cfg(debug_assertions)]
+fn check_projection(text: &str, projected: &Option<Value>) {
+    let reference = loads_strict(text)
+        .ok()
+        .filter(|v| matches!(v, Value::Object(_)));
+    let same = projected.as_ref().map(observe) == reference.as_ref().map(observe);
+    if let Some(value) = reference {
+        discard_record(value);
+    }
+    assert!(
+        same,
+        "Claude record projection differs from a strict load ({} bytes)",
+        text.len()
+    );
+}
+
 pub struct Records {
     reader: Option<BufReader<fs::File>>,
+    line: Vec<u8>,
     index: Option<session_codex::IndexState>,
     position: usize,
     entrypoint: Value,
@@ -156,7 +261,8 @@ pub fn iter_records(path: &Path) -> Records {
     Records {
         reader: util::open_regular(path, Some(&root))
             .ok()
-            .map(BufReader::new),
+            .map(|file| BufReader::with_capacity(1 << 20, file)),
+        line: Vec::new(),
         index: if native {
             Some(session_codex::IndexState::new(
                 codex::rollout_id(path).map(string).unwrap_or(Value::Null),
@@ -176,14 +282,28 @@ impl Iterator for Records {
     fn next(&mut self) -> Option<Value> {
         loop {
             let reader = self.reader.as_mut()?;
-            let mut raw = Vec::new();
-            if reader.read_until(b'\n', &mut raw).is_err() || !raw.ends_with(b"\n") {
+            self.line.clear();
+            if reader.read_until(b'\n', &mut self.line).is_err() || !self.line.ends_with(b"\n") {
                 self.reader = None;
                 return None;
             }
             let position = self.position;
             self.position += 1;
-            let Ok(mut rec) = loads_strict(&ccs_pytext::decode_replace(&raw)) else {
+            if self.index.is_none() {
+                // Valid UTF-8 decodes to itself; only invalid bytes need replacing.
+                let text = match std::str::from_utf8(&self.line) {
+                    Ok(text) => std::borrow::Cow::Borrowed(text),
+                    Err(_) => std::borrow::Cow::Owned(ccs_pytext::decode_replace(&self.line)),
+                };
+                let projected = project_claude(&text);
+                #[cfg(debug_assertions)]
+                check_projection(&text, &projected);
+                match projected {
+                    Some(rec) => return Some(rec),
+                    None => continue,
+                }
+            }
+            let Ok(mut rec) = loads_strict(&ccs_pytext::decode_replace(&self.line)) else {
                 continue;
             };
             if !matches!(rec, Value::Object(_)) {
@@ -505,6 +625,7 @@ mod tests {
         fs::write(&path, concat!(r#"{"type":"response_item","payload":{"type":"message","role":"user","content":"needle\ud800"}}"#, "\n")).unwrap();
         let records = Records {
             reader: Some(BufReader::new(fs::File::open(&path).unwrap())),
+            line: Vec::new(),
             index: Some(session_codex::IndexState::new(Value::Null, None)),
             position: 0,
             entrypoint: Value::Null,
@@ -615,5 +736,189 @@ mod tests {
             &loads_strict(r#""custom\udfff title""#).unwrap()
         );
         assert_eq!(get(&value, "last_texts"), &Value::Array(vec![]));
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    fn strict(line: &str) -> Option<Value> {
+        loads_strict(line)
+            .ok()
+            .filter(|v| matches!(v, Value::Object(_)))
+    }
+
+    /// Claude-shaped lines: every field the projection reads, in every value
+    /// type, under escaped keys, beside payloads that hide rejections.
+    fn claude_lines() -> Vec<String> {
+        let mut lines = vec![];
+        let kinds = [
+            r#""user""#,
+            r#""assistant""#,
+            r#""user""#,
+            r#""summary""#,
+            r#""custom-title""#,
+            r#""ai-title""#,
+            r#""system""#,
+            "1",
+            "null",
+        ];
+        let contents = [
+            r#""plain needle text""#,
+            r#""<system-reminder>x</system-reminder> Straße \ud800 tail""#,
+            r#"[{"type":"text","text":"block needle"},{"type":"tool_use","input":{"a":[1,2,{"b":"c"}]}}]"#,
+            r#"[{"text":"text first","type":"text"},"loose",3,[1],{"type":"thinking","thinking":"t"}]"#,
+            r#"[{"type":"tool_result","content":[{"type":"text","text":"inside"}]}]"#,
+            r#"[{"type":"text","text":7},{"type":1,"text":"x"},{"text":"esc","type":"text"}]"#,
+            r#"{"type":"text","text":"object content"}"#,
+            "12",
+            "null",
+            "[]",
+            r#""""#,
+        ];
+        let messages = |content: &str| {
+            vec![
+                format!(r#"{{"role":"user","content":{content}}}"#),
+                format!(r#"{{"content":{content},"id":"m"}}"#),
+                format!(r#"[{content}]"#),
+                "\"not an object\"".to_string(),
+            ]
+        };
+        let extras = [
+            String::new(),
+            r#","cwd":"/w","entrypoint":"cli""#.to_string(),
+            r#","cwd":"/esc","relocatedCwd":"/moved""#.to_string(),
+            r#","cwd":7,"entrypoint":null,"relocatedCwd":["/x"]"#.to_string(),
+            r#","isMeta":true"#.to_string(),
+            r#","isMeta":"true","isCompactSummary":1"#.to_string(),
+            r#","isCompactSummary":true"#.to_string(),
+            r#","isMeta":false"#.to_string(),
+            r#","customTitle":"T","aiTitle":"A","summary":"S""#.to_string(),
+            r#","customTitle":5,"summary":"""#.to_string(),
+            r#","toolUseResult":{"stdout":"big \u0000 \\ payload","nested":[[[{"k":"v"}]]]}"#
+                .to_string(),
+            format!(r#","payload":{}1{}"#, "[".repeat(300), "]".repeat(300)),
+            // rejected lines: duplicates, a big integer, a bad escape, inside skipped payloads
+            r#","payload":{"a":1,"a":2}"#.to_string(),
+            r#","payload":{"x":{"y":[{"k":1,"k":2}]}}"#.to_string(),
+            format!(r#","payload":[{}]"#, "9".repeat(4301)),
+            r#","payload":"bad \q escape""#.to_string(),
+            r#","cwd":"/a","cwd":"/b""#.to_string(),
+            r#","type":"user""#.to_string(),
+        ];
+        for kind in kinds {
+            for content in contents {
+                for message in messages(content) {
+                    for extra in &extras {
+                        lines.push(format!(r#"{{"type":{kind},"message":{message}{extra}}}"#));
+                    }
+                }
+            }
+        }
+        for tail in ["", " x", "]", ",", " \r"] {
+            lines.push(format!(
+                r#"{{"type":"user","message":{{"content":"t"}}}}{tail}"#
+            ));
+        }
+        lines.extend(
+            [
+                "[1,2]",
+                "\"a string\"",
+                "null",
+                "{}",
+                r#"{"type":"user"}"#,
+                r#"{"message":{"content":"no type"}}"#,
+                "{\"type\":\"user\",\"message\":{\"content\":\"raw \u{1f600} é\"}}",
+                r#"{"type":"user","message":{"content":"x"}"#,
+                "",
+            ]
+            .map(str::to_string),
+        );
+        let corpus = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../vendor/memory-mcp/conformance/session_redact_r1.jsonl"
+        ))
+        .unwrap();
+        for line in corpus.lines() {
+            if let Ok(Value::Object(fields)) = json::from_str(line) {
+                for (key, value) in fields {
+                    if key == "input".chars().map(u32::from).collect::<Vec<_>>() {
+                        if let Ok(text) = json::dumps_compact(&value, false, false) {
+                            lines.push(text);
+                        }
+                    }
+                }
+            }
+        }
+        lines
+    }
+
+    #[test]
+    fn claude_projection_matches_strict_loading() {
+        let lines = claude_lines();
+        assert!(lines.len() > 10_000, "{}", lines.len());
+        let mut kept = 0;
+        for line in &lines {
+            let text = format!("{line}\n");
+            let projected = project_claude(&text);
+            let reference = strict(&text);
+            assert!(
+                projected.as_ref().map(observe) == reference.as_ref().map(observe),
+                "projection differs on {line:.200}"
+            );
+            kept += usize::from(reference.is_some());
+            if let Some(value) = reference {
+                discard_record(value);
+            }
+        }
+        assert!(
+            kept > 1000 && kept < lines.len(),
+            "kept {kept} of {}",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn claude_scan_matches_strict_records() {
+        let lines = claude_lines();
+        for (n, chunk) in lines.chunks(11).enumerate() {
+            let texts: Vec<String> = chunk.iter().map(|l| format!("{l}\n")).collect();
+            let projected: Vec<Value> = texts.iter().filter_map(|t| project_claude(t)).collect();
+            let reference: Vec<Value> = texts.iter().filter_map(|t| strict(t)).collect();
+            for (query, keep) in [
+                (None, 4),
+                (Some("needle"), 4),
+                (Some("STRASSE"), 0),
+                (Some("t"), 1),
+            ] {
+                let a = scan_records(Path::new("/s.jsonl"), query, keep, projected.clone()).value();
+                let b = scan_records(Path::new("/s.jsonl"), query, keep, reference.clone()).value();
+                assert!(a == b, "scan differs on chunk {n} with query {query:?}");
+            }
+            for value in reference {
+                discard_record(value);
+            }
+        }
+    }
+
+    #[test]
+    fn deep_claude_payloads_are_read_without_recursion() {
+        let deep = format!(
+            r#"{{"type":"user","message":{{"content":"deep"}},"payload":{}1{}}}"#,
+            "[".repeat(20_000),
+            "]".repeat(20_000)
+        );
+        let projected = project_claude(&deep).expect("a deep valid line is kept");
+        assert_eq!(
+            record_text_points(&projected),
+            "deep".chars().map(u32::from).collect::<Vec<_>>()
+        );
+        let rejected = format!(
+            r#"{{"type":"user","message":{{"content":"deep"}},"payload":{}{{"a":1,"a":2}}{}}}"#,
+            "[".repeat(20_000),
+            "]".repeat(20_000)
+        );
+        assert!(project_claude(&rejected).is_none());
     }
 }
